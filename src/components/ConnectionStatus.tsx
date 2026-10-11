@@ -1,37 +1,26 @@
-import { useEffect, useState } from 'react';
-import { supabase, isSupabaseConfigured } from '@/lib/supabase/client';
+import { useState } from 'react';
+import { isSupabaseConfigured } from '@/lib/supabase/client';
+import { useAuth } from '@/stores/AuthContext';
 import { CheckCircle, Database, Loader2, X } from 'lucide-react';
 
 export default function ConnectionStatus() {
-  const [status, setStatus] = useState<'checking' | 'connected' | 'local'>('checking');
-  const [message, setMessage] = useState('Checking storage...');
+  const { isLoading, storageMode } = useAuth();
   const [dismissed, setDismissed] = useState(false);
 
-  useEffect(() => {
-    async function checkConnection() {
-      if (!isSupabaseConfigured) {
-        setStatus('local');
-        setMessage('User-scoped Local Vault DB active');
-        return;
-      }
-      try {
-        const { error } = await supabase.auth.getSession();
-        if (error) {
-          setStatus('local');
-          setMessage('Hybrid Local Vault DB active');
-        } else {
-          setStatus('connected');
-          setMessage('Supabase Cloud + Local Sync active');
-        }
-      } catch {
-        setStatus('local');
-        setMessage('User-scoped Local Vault DB active');
-      }
-    }
-    checkConnection();
-  }, []);
-
   if (dismissed) return null;
+
+  const status: 'checking' | 'connected' | 'local' = isLoading
+    ? 'checking'
+    : isSupabaseConfigured && storageMode === 'supabase'
+      ? 'connected'
+      : 'local';
+
+  const message =
+    status === 'checking'
+      ? 'Checking storage...'
+      : status === 'connected'
+        ? 'Supabase Cloud + Local Sync active'
+        : 'User-scoped Local Vault DB active';
 
   return (
     <div className="fixed bottom-4 right-4 z-40 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-slate-200 dark:border-slate-800 rounded-xl shadow-lg px-3.5 py-2.5 flex items-center gap-2.5 text-xs">

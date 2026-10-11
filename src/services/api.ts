@@ -27,6 +27,42 @@ import type {
   TaskPriority,
 } from '@/types';
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+let supabaseRemoteActive = isSupabaseConfigured;
+
+export function setSupabaseSessionActive(active: boolean): void {
+  supabaseRemoteActive = isSupabaseConfigured && active;
+}
+
+export function isUuid(value?: string | null): boolean {
+  return Boolean(value && UUID_REGEX.test(value));
+}
+
+function canUseSupabase(idToValidate?: string | null): boolean {
+  if (!isSupabaseConfigured || !supabaseRemoteActive) return false;
+  if (idToValidate !== undefined && idToValidate !== null && !isUuid(idToValidate)) {
+    return false;
+  }
+  return true;
+}
+
+const profileCacheTimestamp = new Map<string, number>();
+const PROFILE_CACHE_TTL_MS = 60_000;
+let inFlightProfilePromise: Promise<void> | null = null;
+
+export function primeProfileCache(profile: Profile): void {
+  if (!profile?.id) return;
+  profileCacheTimestamp.set(profile.id, Date.now());
+  const db = loadLocalDb();
+  const idx = db.profiles.findIndex(p => p.id === profile.id);
+  if (idx >= 0) {
+    db.profiles[idx] = profile;
+  } else {
+    db.profiles.push(profile);
+  }
+  saveLocalDb(db);
+}
+
 // ─── Workspaces ─────────────────────────────────────────────────────
 
 export async function createWorkspace(
@@ -53,7 +89,7 @@ export async function createWorkspace(
     updated_at: now,
   };
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(ownerId)) {
     try {
       const { data: workspace, error } = await supabase
         .from('workspaces')
@@ -123,22 +159,15 @@ export async function getWorkspaces(
     }
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(userId)) {
     try {
-      const [{ data: memberData }, { data: ownedData }] = await Promise.all([
-        supabase
-          .from('workspace_members')
-          .select(`
-            workspace:workspaces(*),
-            role
-          `)
-          .eq('user_id', userId),
-        supabase
-          .from('workspaces')
-          .select('*')
-          .eq('owner_id', userId)
-          .eq('is_archived', false),
-      ]);
+      const { data: memberData } = await supabase
+        .from('workspace_members')
+        .select(`
+          workspace:workspaces(*),
+          role
+        `)
+        .eq('user_id', userId);
 
       const remoteMap = new Map<string, Workspace & { member_role: UserRole }>();
 
@@ -153,16 +182,25 @@ export async function getWorkspaces(
         }
       }
 
-      if (ownedData) {
-        for (const ow of ownedData as Workspace[]) {
-          if (!ow.is_archived && !isIdDeleted(db, ow.id) && !remoteMap.has(ow.id)) {
-            remoteMap.set(ow.id, { ...ow, member_role: 'owner' });
-            await supabase
-              .from('workspace_members')
-              .upsert(
-                { workspace_id: ow.id, user_id: userId, role: 'owner' },
-                { onConflict: 'workspace_id,user_id' }
-              );
+      // Only query owned workspaces separately if workspace_members returned none
+      if (remoteMap.size === 0) {
+        const { data: ownedData } = await supabase
+          .from('workspaces')
+          .select('*')
+          .eq('owner_id', userId)
+          .eq('is_archived', false);
+
+        if (ownedData) {
+          for (const ow of ownedData as Workspace[]) {
+            if (!ow.is_archived && !isIdDeleted(db, ow.id) && !remoteMap.has(ow.id)) {
+              remoteMap.set(ow.id, { ...ow, member_role: 'owner' });
+              await supabase
+                .from('workspace_members')
+                .upsert(
+                  { workspace_id: ow.id, user_id: userId, role: 'owner' },
+                  { onConflict: 'workspace_id,user_id' }
+                );
+            }
           }
         }
       }
@@ -293,7 +331,7 @@ export async function archiveWorkspace(id: string, actorId?: string): Promise<Wo
 
 // ─── Workspace Members ──────────────────────────────────────────────
 
-// ─── Profile Lookup Helper (Prevents PGRST200 on auth.users FK columns) ───
+// ─── Profile Lookup Helper (Prevents PGRST200 & Deduplicates Concurrent Calls) ───
 
 async function resolveProfilesByIds(
   rawIds: (string | null | undefined)[]
@@ -305,34 +343,70 @@ async function resolveProfilesByIds(
     profileMap.set(p.id, p);
   }
 
+  const nowMs = Date.now();
   const uniqueIds = Array.from(
-    new Set(rawIds.filter((id): id is string => Boolean(id && id.trim())))
+    new Set(rawIds.filter((id): id is string => Boolean(id && id.trim() && isUuid(id))))
   );
 
-  if (isSupabaseConfigured && uniqueIds.length > 0) {
-    try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('*')
-        .in('id', uniqueIds);
-      if (!error && data) {
-        let updatedLocal = false;
-        for (const prof of data as Profile[]) {
-          profileMap.set(prof.id, prof);
-          const idx = db.profiles.findIndex(lp => lp.id === prof.id);
-          if (idx >= 0) {
-            db.profiles[idx] = prof;
-          } else {
-            db.profiles.push(prof);
+  if (canUseSupabase() && uniqueIds.length > 0) {
+    if (inFlightProfilePromise) {
+      await inFlightProfilePromise.catch(() => {});
+      const refreshedDb = loadLocalDb();
+      for (const p of refreshedDb.profiles) {
+        profileMap.set(p.id, p);
+      }
+    }
+
+    const staleOrMissingIds = uniqueIds.filter(id => {
+      const lastFetched = profileCacheTimestamp.get(id) || 0;
+      return !profileMap.has(id) || nowMs - lastFetched > PROFILE_CACHE_TTL_MS;
+    });
+
+    if (staleOrMissingIds.length > 0) {
+      const fetchTask = (async () => {
+        try {
+          const { data, error } = await supabase
+            .from('profiles')
+            .select('*')
+            .in('id', staleOrMissingIds);
+          if (!error && data) {
+            const latestDb = loadLocalDb();
+            let updatedLocal = false;
+            const fetchedAt = Date.now();
+            for (const prof of data as Profile[]) {
+              profileMap.set(prof.id, prof);
+              profileCacheTimestamp.set(prof.id, fetchedAt);
+              const idx = latestDb.profiles.findIndex(lp => lp.id === prof.id);
+              if (idx >= 0) {
+                latestDb.profiles[idx] = prof;
+              } else {
+                latestDb.profiles.push(prof);
+              }
+              updatedLocal = true;
+            }
+            // Mark requested IDs as checked even if no row returned so we don't spam retries
+            for (const reqId of staleOrMissingIds) {
+              if (!profileCacheTimestamp.has(reqId)) {
+                profileCacheTimestamp.set(reqId, fetchedAt);
+              }
+            }
+            if (updatedLocal) {
+              saveLocalDb(latestDb);
+            }
           }
-          updatedLocal = true;
+        } catch {
+          // Fallback to local profileMap
         }
-        if (updatedLocal) {
-          saveLocalDb(db);
+      })();
+
+      inFlightProfilePromise = fetchTask;
+      try {
+        await fetchTask;
+      } finally {
+        if (inFlightProfilePromise === fetchTask) {
+          inFlightProfilePromise = null;
         }
       }
-    } catch {
-      // Fallback to local profileMap
     }
   }
 
@@ -364,7 +438,7 @@ export async function getWorkspaceMembers(
       },
     }));
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId)) {
     try {
       const { data, error } = await supabase
         .from('workspace_members')
@@ -446,7 +520,7 @@ export async function addWorkspaceMember(
   db.workspace_members.push(member);
   saveLocalDb(db);
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId) && isUuid(userId)) {
     try {
       const { data, error } = await supabase
         .from('workspace_members')
@@ -486,7 +560,7 @@ export async function removeWorkspaceMember(workspaceId: string, userId: string)
   );
   saveLocalDb(db);
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId) && isUuid(userId)) {
     try {
       await supabase
         .from('workspace_members')
@@ -513,7 +587,7 @@ export async function updateMemberRole(
     saveLocalDb(db);
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId) && isUuid(userId)) {
     try {
       await supabase
         .from('workspace_members')
@@ -586,7 +660,7 @@ export async function createInvitation(
     metadata: { email: invitation.email, role },
   });
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId) && isUuid(invitedBy)) {
     try {
       const { data, error } = await supabase
         .from('workspace_invitations')
@@ -628,7 +702,7 @@ export async function getPendingInvitations(workspaceId: string): Promise<Worksp
       !isIdDeleted(db, inv.id)
   );
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId)) {
     try {
       const { data, error } = await supabase
         .from('workspace_invitations')
@@ -669,7 +743,7 @@ export async function revokeInvitation(invitationId: string, actorId?: string): 
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(invitationId)) {
     try {
       await supabase
         .from('workspace_invitations')
@@ -734,32 +808,8 @@ export async function createProject(
   const provisionalLocalId = createdProject.id;
   saveLocalDb(db);
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId) && isUuid(ownerId)) {
     try {
-      // Ensure the workspace and owner membership row exist in Supabase first (prevents 42501 RLS violation on projects)
-      const localWs = db.workspaces.find(w => w.id === workspaceId);
-      if (localWs) {
-        await supabase.from('workspaces').upsert(
-          {
-            id: localWs.id,
-            name: localWs.name,
-            slug: localWs.slug,
-            description: localWs.description,
-            owner_id: ownerId,
-            is_archived: false,
-          },
-          { onConflict: 'id' }
-        );
-      }
-      await supabase.from('workspace_members').upsert(
-        {
-          workspace_id: workspaceId,
-          user_id: ownerId,
-          role: 'owner',
-        },
-        { onConflict: 'workspace_id,user_id' }
-      );
-
       const { data: rpcProject, error: rpcError } = await supabase.rpc('create_project_with_defaults', {
         p_workspace_id: workspaceId,
         p_name: name.trim(),
@@ -771,7 +821,30 @@ export async function createProject(
         createdProject = rpcProject as Project;
         replaceLocalProjectId(provisionalLocalId, createdProject);
       } else {
-        // Fallback to direct table insert if RPC migration was not applied
+        // Fallback: ensure workspace and owner membership exist if RPC failed or wasn't installed
+        const localWs = db.workspaces.find(w => w.id === workspaceId);
+        if (localWs) {
+          await supabase.from('workspaces').upsert(
+            {
+              id: localWs.id,
+              name: localWs.name,
+              slug: localWs.slug,
+              description: localWs.description,
+              owner_id: ownerId,
+              is_archived: false,
+            },
+            { onConflict: 'id' }
+          );
+        }
+        await supabase.from('workspace_members').upsert(
+          {
+            workspace_id: workspaceId,
+            user_id: ownerId,
+            role: 'owner',
+          },
+          { onConflict: 'workspace_id,user_id' }
+        );
+
         const { data: directProject, error: directError } = await supabase
           .from('projects')
           .insert({
@@ -835,7 +908,7 @@ export async function getProjects(workspaceId?: string): Promise<Project[]> {
         (!workspaceId || p.workspace_id === workspaceId)
     );
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId)) {
     try {
       let query = supabase.from('projects').select('*').order('created_at', { ascending: false });
       if (workspaceId) query = query.eq('workspace_id', workspaceId);
@@ -878,7 +951,8 @@ export async function getProjects(workspaceId?: string): Promise<Project[]> {
 export async function updateProject(
   id: string,
   updates: Partial<Project>,
-  actorId?: string
+  actorId?: string,
+  auditAction: string = 'project.updated'
 ): Promise<Project> {
   const now = new Date().toISOString();
   const normalizedUpdates: Partial<Project> = { ...updates };
@@ -905,41 +979,40 @@ export async function updateProject(
 
   let finalProject: Project | null = updatedLocal;
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(id)) {
     try {
-      // Ensure workspace_members row exists before updating so legacy RLS policies succeed
-      const wsId = updatedLocal?.workspace_id || updates.workspace_id;
-      const uid = actorId || updatedLocal?.owner_id;
-      if (wsId && uid) {
-        await supabase.from('workspace_members').upsert(
-          { workspace_id: wsId, user_id: uid, role: 'owner' },
-          { onConflict: 'workspace_id,user_id' }
-        );
-      }
+      // 1. Standard single PATCH request first (avoids 404 RPC error if migration 005 RPC is not installed)
+      const { data, error } = await supabase
+        .from('projects')
+        .update({ ...normalizedUpdates, updated_at: now })
+        .eq('id', id)
+        .select()
+        .maybeSingle();
 
-      // First try SECURITY DEFINER RPC if migration 005 is installed
-      const { data: rpcData, error: rpcErr } = await supabase.rpc('update_project_safe', {
-        p_project_id: id,
-        p_name: normalizedUpdates.name ?? null,
-        p_slug: normalizedUpdates.slug ?? null,
-        p_description:
-          normalizedUpdates.description !== undefined ? normalizedUpdates.description : null,
-        p_repository_url:
-          normalizedUpdates.repository_url !== undefined ? normalizedUpdates.repository_url : null,
-        p_status: normalizedUpdates.status ?? null,
-      });
-
-      if (!rpcErr && rpcData) {
-        finalProject = rpcData as Project;
+      if (!error && data) {
+        finalProject = data as Project;
       } else {
-        const { data, error } = await supabase
-          .from('projects')
-          .update({ ...normalizedUpdates, updated_at: now })
-          .eq('id', id)
-          .select()
-          .single();
-        if (!error && data) {
-          finalProject = data as Project;
+        // 2. Fallback: repair workspace_members & call SECURITY DEFINER RPC only when direct update fails
+        const wsId = updatedLocal?.workspace_id || updates.workspace_id;
+        const uid = actorId || updatedLocal?.owner_id;
+        if (wsId && uid && isUuid(wsId) && isUuid(uid)) {
+          await supabase.from('workspace_members').upsert(
+            { workspace_id: wsId, user_id: uid, role: 'owner' },
+            { onConflict: 'workspace_id,user_id' }
+          );
+        }
+        const { data: rpcData, error: rpcErr } = await supabase.rpc('update_project_safe', {
+          p_project_id: id,
+          p_name: normalizedUpdates.name ?? null,
+          p_slug: normalizedUpdates.slug ?? null,
+          p_description:
+            normalizedUpdates.description !== undefined ? normalizedUpdates.description : null,
+          p_repository_url:
+            normalizedUpdates.repository_url !== undefined ? normalizedUpdates.repository_url : null,
+          p_status: normalizedUpdates.status ?? null,
+        });
+        if (!rpcErr && rpcData) {
+          finalProject = rpcData as Project;
         }
       }
 
@@ -981,7 +1054,7 @@ export async function updateProject(
   if (actorId) {
     await logAuditEvent({
       actor_id: actorId,
-      action: 'project.updated',
+      action: auditAction,
       resource_type: 'project',
       resource_id: id,
       workspace_id: finalProject.workspace_id,
@@ -999,19 +1072,7 @@ export async function updateProject(
 }
 
 export async function archiveProject(id: string, actorId?: string): Promise<Project> {
-  const updated = await updateProject(id, { status: 'archived' }, actorId);
-  if (actorId) {
-    await logAuditEvent({
-      actor_id: actorId,
-      action: 'project.archived',
-      resource_type: 'project',
-      resource_id: id,
-      workspace_id: updated.workspace_id,
-      project_id: id,
-      outcome: 'success',
-    });
-  }
-  return updated;
+  return updateProject(id, { status: 'archived' }, actorId, 'project.archived');
 }
 
 export async function deleteProject(id: string, actorId?: string): Promise<void> {
@@ -1046,21 +1107,19 @@ export async function deleteProject(id: string, actorId?: string): Promise<void>
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(id)) {
     try {
-      if (target?.workspace_id && (actorId || target.owner_id)) {
-        await supabase.from('workspace_members').upsert(
-          {
-            workspace_id: target.workspace_id,
-            user_id: actorId || target.owner_id,
-            role: 'owner',
-          },
-          { onConflict: 'workspace_id,user_id' }
-        );
+      // 1. Standard DELETE request first
+      const { data: deletedRows, error: delError } = await supabase
+        .from('projects')
+        .delete()
+        .eq('id', id)
+        .select('id');
+
+      // 2. Only fall back to SECURITY DEFINER RPC if standard DELETE failed or removed 0 rows
+      if (delError || !deletedRows || deletedRows.length === 0) {
+        await supabase.rpc('delete_project_safe', { p_project_id: id });
       }
-      // Try SECURITY DEFINER RPC first, then standard table DELETE
-      await supabase.rpc('delete_project_safe', { p_project_id: id });
-      await supabase.from('projects').delete().eq('id', id);
     } catch {
       // Handled locally via tombstone + localDb removal
     }
@@ -1098,7 +1157,7 @@ export async function getEnvironments(projectId: string): Promise<Environment[]>
     saveLocalDb(db);
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId)) {
     try {
       const { data, error } = await supabase
         .from('environments')
@@ -1166,7 +1225,7 @@ export async function createEnvironment(
   db.environments.push(env);
   saveLocalDb(db);
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId)) {
     try {
       const { data, error } = await supabase
         .from('environments')
@@ -1204,7 +1263,7 @@ export async function getSecrets(environmentId: string): Promise<EncryptedSecret
       )
       .sort((a, b) => a.variable_name.localeCompare(b.variable_name));
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(environmentId)) {
     try {
       const { data, error } = await supabase
         .from('encrypted_secrets')
@@ -1329,7 +1388,7 @@ export async function createSecret(
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(environmentId) && isUuid(projectId)) {
     try {
       const { data, error } = await supabase
         .from('encrypted_secrets')
@@ -1387,7 +1446,7 @@ export async function deleteSecret(id: string, actorId?: string): Promise<void> 
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(id)) {
     try {
       await supabase.from('encrypted_secrets').delete().eq('id', id);
     } catch {
@@ -1410,7 +1469,7 @@ export async function getBranches(projectId: string): Promise<Branch[]> {
       )
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId)) {
     try {
       const { data, error } = await supabase
         .from('branches')
@@ -1498,7 +1557,7 @@ export async function createBranch(
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId)) {
     try {
       const { data, error } = await supabase
         .from('branches')
@@ -1543,7 +1602,7 @@ export async function updateBranch(id: string, updates: Partial<Branch>): Promis
     saveLocalDb(db);
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(id)) {
     try {
       const { data, error } = await supabase
         .from('branches')
@@ -1592,7 +1651,7 @@ export async function deleteBranch(id: string, actorId?: string): Promise<void> 
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(id)) {
     try {
       await supabase.from('branches').delete().eq('id', id);
     } catch {
@@ -1632,7 +1691,7 @@ export async function getTasks(
       }));
   };
 
-  if (isSupabaseConfigured && projectId) {
+  if (canUseSupabase(projectId) && projectId) {
     try {
       let query = supabase
         .from('tasks')
@@ -1728,7 +1787,7 @@ export async function createTask(
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId)) {
     try {
       const { data, error } = await supabase
         .from('tasks')
@@ -1739,7 +1798,7 @@ export async function createTask(
           priority,
           status: task.status,
           due_date: task.due_date,
-          assignee_id: task.assignee_id,
+          assignee_id: isUuid(task.assignee_id) ? task.assignee_id : null,
         })
         .select()
         .single();
@@ -1787,7 +1846,7 @@ export async function updateTask(
     }
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(id)) {
     try {
       const { data, error } = await supabase
         .from('tasks')
@@ -1833,7 +1892,7 @@ export async function deleteTask(id: string, actorId?: string): Promise<void> {
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(id)) {
     try {
       await supabase.from('tasks').delete().eq('id', id);
     } catch {
@@ -1874,10 +1933,13 @@ export async function logAuditEvent(event: {
   }
   saveLocalDb(db);
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(event.actor_id)) {
     try {
       await supabase.from('audit_events').insert({
         ...event,
+        resource_id: isUuid(event.resource_id) ? event.resource_id : undefined,
+        workspace_id: isUuid(event.workspace_id) ? event.workspace_id : undefined,
+        project_id: isUuid(event.project_id) ? event.project_id : undefined,
         outcome: event.outcome || 'success',
         metadata: event.metadata || {},
       });
@@ -1900,7 +1962,7 @@ export async function getAuditEvents(
       actor: ev.actor_id ? db.profiles.find(p => p.id === ev.actor_id) : undefined,
     }));
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(workspaceId)) {
     try {
       let query = supabase
         .from('audit_events')
@@ -1938,7 +2000,7 @@ export async function getProjectKeyEnvelope(
     e => e.project_id === projectId && e.user_id === userId
   );
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId) && isUuid(userId)) {
     try {
       const { data, error } = await supabase
         .from('project_key_envelopes')
@@ -1980,16 +2042,19 @@ export async function storeProjectKeyEnvelope(
   else db.project_key_envelopes.push(record);
   saveLocalDb(db);
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId) && isUuid(userId)) {
     try {
       const { data, error } = await supabase
         .from('project_key_envelopes')
-        .upsert({
-          project_id: projectId,
-          user_id: userId,
-          encrypted_project_key: encryptedProjectKey,
-          key_version: keyVersion,
-        })
+        .upsert(
+          {
+            project_id: projectId,
+            user_id: userId,
+            encrypted_project_key: encryptedProjectKey,
+            key_version: keyVersion,
+          },
+          { onConflict: 'project_id,user_id' }
+        )
         .select()
         .single();
       if (!error && data) return data as ProjectKeyEnvelope;
@@ -2007,7 +2072,7 @@ export async function getProjectIntegrations(projectId: string): Promise<Integra
   const db = loadLocalDb();
   const localInt = db.integration_connections.filter(i => i.project_id === projectId);
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId)) {
     try {
       const { data, error } = await supabase
         .from('integration_connections')
@@ -2080,19 +2145,22 @@ export async function updateIntegrationStatus(
     });
   }
 
-  if (isSupabaseConfigured) {
+  if (canUseSupabase(projectId)) {
     try {
       const { data, error: dbError } = await supabase
         .from('integration_connections')
-        .upsert({
-          project_id: projectId,
-          provider,
-          status,
-          scopes: record.scopes,
-          metadata: record.metadata,
-          last_error: record.last_error,
-          last_sync_at: record.last_sync_at,
-        })
+        .upsert(
+          {
+            project_id: projectId,
+            provider,
+            status,
+            scopes: record.scopes,
+            metadata: record.metadata,
+            last_error: record.last_error,
+            last_sync_at: record.last_sync_at,
+          },
+          { onConflict: 'project_id,provider' }
+        )
         .select()
         .single();
       if (!dbError && data) return data as IntegrationConnection;

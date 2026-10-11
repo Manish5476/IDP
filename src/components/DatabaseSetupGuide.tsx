@@ -1,23 +1,34 @@
 import { useState, useEffect } from 'react';
 import { supabase, isSupabaseConfigured } from '@/lib/supabase/client';
+import { useAuth } from '@/stores/AuthContext';
 import { Database, ExternalLink, Copy, Check, X } from 'lucide-react';
 
+const SCHEMA_VERIFIED_KEY = 'idp_supabase_schema_verified';
+
 export default function DatabaseSetupGuide() {
-  const [status, setStatus] = useState<'checking' | 'ready' | 'needs_setup'>('checking');
+  const { user, storageMode } = useAuth();
+  const [status, setStatus] = useState<'checking' | 'ready' | 'needs_setup'>('ready');
   const [copied, setCopied] = useState(false);
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {
-    if (!isSupabaseConfigured) {
+    if (!isSupabaseConfigured || !user || storageMode !== 'supabase') {
+      setStatus('ready');
+      return;
+    }
+    if (typeof window !== 'undefined' && window.sessionStorage.getItem(SCHEMA_VERIFIED_KEY) === '1') {
       setStatus('ready');
       return;
     }
     async function checkDatabase() {
       try {
-        const { error } = await supabase.from('profiles').select('count').limit(1);
+        const { error } = await supabase.from('profiles').select('id').limit(1);
         if (error && (error.message.includes('does not exist') || error.code === '42P01')) {
           setStatus('needs_setup');
         } else {
+          if (typeof window !== 'undefined') {
+            window.sessionStorage.setItem(SCHEMA_VERIFIED_KEY, '1');
+          }
           setStatus('ready');
         }
       } catch {
@@ -25,7 +36,7 @@ export default function DatabaseSetupGuide() {
       }
     }
     checkDatabase();
-  }, []);
+  }, [user, storageMode]);
 
   const handleCopy = () => {
     const sqlInstructions = `Go to your Supabase Dashboard → SQL Editor → New Query, then paste the contents of supabase/migrations/001_initial_schema.sql and click Run.`;

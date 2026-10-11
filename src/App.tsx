@@ -814,10 +814,10 @@ function AppLayout({ children }: { children: ReactNode }) {
   }, [darkMode]);
 
   useEffect(() => {
-    if (showNotifications && activeWorkspace) {
+    if (showNotifications && activeWorkspace?.id) {
       getAuditEvents(activeWorkspace.id, 8).then(setRecentEvents).catch(() => {});
     }
-  }, [showNotifications, activeWorkspace]);
+  }, [showNotifications, activeWorkspace?.id]);
 
   const pageTitle = useMemo(() => {
     const p = location.pathname;
@@ -1167,7 +1167,7 @@ function AppLayout({ children }: { children: ReactNode }) {
 // ─── Dashboard Page (1:1 Bento Pro 2.0 Reference Design) ────────────
 function DashboardPage() {
   const { profile, vault, openVaultModal } = useAuth();
-  const { activeWorkspace, projects, activeProject, setActiveProject } = useWorkspace();
+  const { activeWorkspace, projects, activeProject, setActiveProject, projectsLoading } = useWorkspace();
   const navigate = useNavigate();
 
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -1178,25 +1178,32 @@ function DashboardPage() {
   const [selectedMetricTab, setSelectedMetricTab] = useState<'projects' | 'secrets'>('projects');
   const [activeBarIndex, setActiveBarIndex] = useState<number>(3);
 
-  useEffect(() => {
-    if (!activeWorkspace) return;
-    getTasks(activeProject?.id, undefined, activeWorkspace.id).then(setTasks).catch(() => {});
-    getWorkspaceMembers(activeWorkspace.id).then(setMembers).catch(() => {});
-    getAuditEvents(activeWorkspace.id, 6).then(setAuditEvents).catch(() => {});
-  }, [activeWorkspace, activeProject]);
+  const activeWorkspaceId = activeWorkspace?.id;
+  const activeProjectId = activeProject?.id;
 
   useEffect(() => {
-    if (!activeProject) {
+    if (!activeWorkspaceId) return;
+    getWorkspaceMembers(activeWorkspaceId).then(setMembers).catch(() => {});
+    getAuditEvents(activeWorkspaceId, 6).then(setAuditEvents).catch(() => {});
+  }, [activeWorkspaceId]);
+
+  useEffect(() => {
+    if (!activeWorkspaceId || projectsLoading) return;
+    getTasks(activeProjectId, undefined, activeWorkspaceId).then(setTasks).catch(() => {});
+  }, [activeWorkspaceId, activeProjectId, projectsLoading]);
+
+  useEffect(() => {
+    if (!activeProjectId) {
       setSecretCount(0);
       return;
     }
-    getProjectSecretCounts(activeProject.id)
+    getProjectSecretCounts(activeProjectId)
       .then(counts => {
         const total = Object.values(counts).reduce((acc, n) => acc + n, 0);
         setSecretCount(total);
       })
       .catch(() => {});
-  }, [activeProject]);
+  }, [activeProjectId]);
 
   const openTasks = tasks.filter(t => t.status !== 'done');
   const completedTasks = tasks.filter(t => t.status === 'done');
@@ -2739,31 +2746,40 @@ function EnvironmentsPage() {
   const [parsedEntries, setParsedEntries] = useState<ParsedEnvEntry[]>([]);
   const [importing, setImporting] = useState(false);
 
+  const activeProjectId = activeProject?.id;
+  const selectedEnvId = selectedEnv?.id;
+
   const loadEnvironmentsAndCounts = useCallback(async () => {
-    if (!activeProject) {
+    if (!activeProjectId) {
       setEnvironments([]);
       setSelectedEnv(null);
       setSecrets([]);
       return;
     }
     const [envs, counts] = await Promise.all([
-      getEnvironments(activeProject.id),
-      getProjectSecretCounts(activeProject.id),
+      getEnvironments(activeProjectId),
+      getProjectSecretCounts(activeProjectId),
     ]);
     setEnvironments(envs);
     setSecretCounts(counts);
-    setSelectedEnv(current => envs.find(e => e.id === current?.id) || envs[0] || null);
-  }, [activeProject]);
+    setSelectedEnv(current => {
+      const found = envs.find(e => e.id === current?.id) || envs[0] || null;
+      if (current && found && current.id === found.id && current.updated_at === found.updated_at) {
+        return current;
+      }
+      return found;
+    });
+  }, [activeProjectId]);
 
   const loadSecretsForEnv = useCallback(async () => {
-    if (!selectedEnv) {
+    if (!selectedEnvId) {
       setSecrets([]);
       return;
     }
-    const list = await getSecrets(selectedEnv.id);
+    const list = await getSecrets(selectedEnvId);
     setSecrets(list);
     setRevealedValues({});
-  }, [selectedEnv]);
+  }, [selectedEnvId]);
 
   useEffect(() => {
     loadEnvironmentsAndCounts();
@@ -3318,14 +3334,16 @@ function BranchesPage() {
   const [commitMessage, setCommitMessage] = useState('');
   const [syncing, setSyncing] = useState(false);
 
+  const activeProjectId = activeProject?.id;
+
   const loadBranches = useCallback(async () => {
-    if (!activeProject) {
+    if (!activeProjectId) {
       setBranches([]);
       return;
     }
-    const list = await getBranches(activeProject.id);
+    const list = await getBranches(activeProjectId);
     setBranches(list);
-  }, [activeProject]);
+  }, [activeProjectId]);
 
   useEffect(() => {
     loadBranches();
@@ -3589,14 +3607,17 @@ function TasksPage() {
 
   const columnOrder: TaskStatus[] = ['backlog', 'todo', 'in_progress', 'review', 'done'];
 
+  const activeProjectId = activeProject?.id;
+  const activeWorkspaceId = activeWorkspace?.id;
+
   const loadTasks = useCallback(async () => {
-    if (!activeProject) {
+    if (!activeProjectId) {
       setTasks([]);
       return;
     }
-    const list = await getTasks(activeProject.id, undefined, activeWorkspace?.id);
+    const list = await getTasks(activeProjectId, undefined, activeWorkspaceId);
     setTasks(list);
-  }, [activeProject, activeWorkspace?.id]);
+  }, [activeProjectId, activeWorkspaceId]);
 
   useEffect(() => {
     loadTasks();
@@ -4355,15 +4376,17 @@ function MembersPage() {
   const [inviteRole, setInviteRole] = useState<UserRole>('developer');
   const [message, setMessage] = useState('');
 
+  const activeWorkspaceId = activeWorkspace?.id;
+
   const loadMembersData = useCallback(async () => {
-    if (!activeWorkspace) return;
+    if (!activeWorkspaceId) return;
     const [m, inv] = await Promise.all([
-      getWorkspaceMembers(activeWorkspace.id),
-      getPendingInvitations(activeWorkspace.id),
+      getWorkspaceMembers(activeWorkspaceId),
+      getPendingInvitations(activeWorkspaceId),
     ]);
     setMembers(m);
     setInvitations(inv);
-  }, [activeWorkspace]);
+  }, [activeWorkspaceId]);
 
   useEffect(() => {
     loadMembersData();
@@ -4549,14 +4572,16 @@ function IntegrationsPage() {
   const [activeModalProvider, setActiveModalProvider] = useState<'github' | 'gitlab' | 'jira' | 'slack' | null>(null);
   const [targetEndpoint, setTargetEndpoint] = useState('');
 
+  const activeProjectId = activeProject?.id;
+
   const loadConnections = useCallback(async () => {
-    if (!activeProject) {
+    if (!activeProjectId) {
       setConnections([]);
       return;
     }
-    const list = await getProjectIntegrations(activeProject.id);
+    const list = await getProjectIntegrations(activeProjectId);
     setConnections(list);
-  }, [activeProject]);
+  }, [activeProjectId]);
 
   useEffect(() => {
     loadConnections();

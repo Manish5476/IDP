@@ -7,6 +7,7 @@ import {
   hashString,
   ensureUserProvisioned,
 } from '@/lib/storage/localDb';
+import { setSupabaseSessionActive, primeProfileCache } from '@/services/api';
 import type { Profile, UserVault, UserCryptoKey } from '@/types';
 import type { Session, User } from '@supabase/supabase-js';
 
@@ -81,6 +82,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   });
 
   const hydrateUserContext = useCallback(async (user: User, mode: 'supabase' | 'local', force = false) => {
+    setSupabaseSessionActive(mode === 'supabase');
     const nowMs = Date.now();
     if (
       !force &&
@@ -99,45 +101,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const localProfile = ensureUserProvisioned(user.id, email, metaName);
       let resolvedProfile: Profile = localProfile;
 
-      if (mode === 'supabase' && isSupabaseConfigured) {
-        try {
-          const { data, error } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', user.id)
-            .maybeSingle();
-          if (!error && data) {
-            resolvedProfile = data as Profile;
-          }
-        } catch {
-          // Fallback to local profile
-        }
-      }
-
-      // Check vault initialization status in Supabase or localDb
       const db = loadLocalDb();
       let localVault = db.user_vaults.find(v => v.user_id === user.id) || null;
 
       if (mode === 'supabase' && isSupabaseConfigured) {
         try {
-          const { data, error } = await supabase
-            .from('user_vaults')
-            .select('*')
-            .eq('user_id', user.id)
-            .maybeSingle();
-          if (!error && data) {
-            localVault = data as UserVault;
-            // Sync to localDb so offline/hybrid access works
+          const [profRes, vaultRes] = await Promise.all([
+            supabase.from('profiles').select('*').eq('id', user.id).maybeSingle(),
+            supabase.from('user_vaults').select('*').eq('user_id', user.id).maybeSingle(),
+          ]);
+
+          if (!profRes.error && profRes.data) {
+            resolvedProfile = profRes.data as Profile;
+          }
+          if (!vaultRes.error && vaultRes.data) {
+            localVault = vaultRes.data as UserVault;
             const existingIdx = db.user_vaults.findIndex(v => v.user_id === user.id);
             if (existingIdx >= 0) db.user_vaults[existingIdx] = localVault;
             else db.user_vaults.push(localVault);
             saveLocalDb(db);
           }
         } catch {
-          // Use localVault
+          // Fallback to local profile and localVault
         }
       }
 
+      primeProfileCache(resolvedProfile);
       const isVaultInit = Boolean(localVault);
 
       setState(s => ({
@@ -162,8 +151,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     let mounted = true;
 
     async function initSession() {
-      // 1. Check local session first
       const db = loadLocalDb();
+
+      // 1. If the user explicitly chose Quick Demo Access, restore the local demo session without hitting Supabase
+      if (db.currentSessionUserId === 'demo-user-alex-rivera') {
+        const demoUser = db.users.find(u => u.id === 'demo-user-alex-rivera');
+        if (demoUser) {
+          const syntheticUser = makeSyntheticSupabaseUser(
+            demoUser.id,
+            demoUser.email,
+            demoUser.full_name
+          );
+          if (mounted) {
+            await hydrateUserContext(syntheticUser, 'local');
+          }
+          return;
+        }
+      }
+
+      // 2. If Supabase is configured, check the authenticated Supabase JWT session first
+      if (isSupabaseConfigured) {
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          if (session?.user && mounted) {
+            db.currentSessionUserId = session.user.id;
+            saveLocalDb(db);
+            setState(s => ({ ...s, session }));
+            await hydrateUserContext(session.user, 'supabase');
+            return;
+          }
+        } catch {
+          // Ignore and fall through to local session check
+        }
+      }
+
+      // 3. Fallback to local session if offline or local-only account
       if (db.currentSessionUserId) {
         const localUser = db.users.find(u => u.id === db.currentSessionUserId);
         if (localUser) {
@@ -179,20 +201,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      // 2. If Supabase is configured, check Supabase session
-      if (isSupabaseConfigured) {
-        try {
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session?.user && mounted) {
-            setState(s => ({ ...s, session }));
-            await hydrateUserContext(session.user, 'supabase');
-            return;
-          }
-        } catch {
-          // Ignore and fall through
-        }
-      }
-
+      setSupabaseSessionActive(false);
       if (mounted) {
         setState(s => ({ ...s, isLoading: false }));
       }
@@ -289,12 +298,46 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signIn = async (email: string, password: string): Promise<{ error: string | null }> => {
     const normalizedEmail = email.trim().toLowerCase();
-
-    // 1. Check local user database first
     const db = loadLocalDb();
     const pwdHash = await hashString(password);
     const localUser = db.users.find(u => u.email.toLowerCase() === normalizedEmail);
 
+    // 1. If Supabase is configured (and not the local demo account), sign in via Supabase first so a fresh JWT is acquired
+    if (isSupabaseConfigured && normalizedEmail !== 'alex.rivera@devportal.io') {
+      try {
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: normalizedEmail,
+          password,
+        });
+        if (!error && data.user) {
+          if (!localUser) {
+            db.users.push({
+              id: data.user.id,
+              email: normalizedEmail,
+              password_hash: pwdHash,
+              full_name: (data.user.user_metadata?.full_name as string) || normalizedEmail.split('@')[0],
+              created_at: new Date().toISOString(),
+            });
+          } else {
+            localUser.password_hash = pwdHash;
+          }
+          db.currentSessionUserId = data.user.id;
+          saveLocalDb(db);
+          setState(s => ({ ...s, session: data.session }));
+          await hydrateUserContext(data.user, 'supabase');
+          return { error: null };
+        }
+        if (error && !localUser) {
+          return { error: error.message };
+        }
+      } catch (err) {
+        if (!localUser) {
+          return { error: err instanceof Error ? err.message : 'Sign-in failed' };
+        }
+      }
+    }
+
+    // 2. Fallback to local user database (offline mode or local-only account)
     if (localUser) {
       if (localUser.password_hash !== pwdHash) {
         return { error: 'Invalid email or password.' };
@@ -308,25 +351,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       );
       await hydrateUserContext(syntheticUser, 'local');
       return { error: null };
-    }
-
-    // 2. Try Supabase Auth if configured
-    if (isSupabaseConfigured) {
-      try {
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: normalizedEmail,
-          password,
-        });
-        if (!error && data.user) {
-          await hydrateUserContext(data.user, 'supabase');
-          return { error: null };
-        }
-        if (error) {
-          return { error: error.message };
-        }
-      } catch (err) {
-        return { error: err instanceof Error ? err.message : 'Sign-in failed' };
-      }
     }
 
     return { error: 'No account found with this email. Create an account or use Quick Demo Access.' };
@@ -474,6 +498,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signOut = async () => {
+    setSupabaseSessionActive(false);
     const db = loadLocalDb();
     db.currentSessionUserId = null;
     saveLocalDb(db);
@@ -597,25 +622,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       saveLocalDb(db);
 
-      // Also persist to Supabase if configured
+      // Also persist to Supabase if configured (with onConflict: 'user_id' to prevent 409 Conflict)
       if (isSupabaseConfigured && state.storageMode === 'supabase') {
         try {
-          await supabase.from('user_vaults').upsert({
-            user_id: state.user.id,
-            encrypted_vault_key: vaultData.encryptedVaultKey,
-            kdf_salt: vaultData.salt,
-            kdf_algorithm: 'argon2id',
-            kdf_version: 1,
-            kdf_params: { memoryCost: 65536, timeCost: 3, parallelism: 4 },
-            recovery_envelope: recoveryBundle,
-            crypto_version: '1',
-          });
-          await supabase.from('user_crypto_keys').upsert({
-            user_id: state.user.id,
-            public_key: publicKeyJwk,
-            encrypted_private_key: encPrivKey,
-            key_version: 1,
-          });
+          await supabase.from('user_vaults').upsert(
+            {
+              user_id: state.user.id,
+              encrypted_vault_key: vaultData.encryptedVaultKey,
+              kdf_salt: vaultData.salt,
+              kdf_algorithm: 'argon2id',
+              kdf_version: 1,
+              kdf_params: { memoryCost: 65536, timeCost: 3, parallelism: 4 },
+              recovery_envelope: recoveryBundle,
+              crypto_version: '1',
+            },
+            { onConflict: 'user_id' }
+          );
+          await supabase.from('user_crypto_keys').upsert(
+            {
+              user_id: state.user.id,
+              public_key: publicKeyJwk,
+              encrypted_private_key: encPrivKey,
+              key_version: 1,
+            },
+            { onConflict: 'user_id' }
+          );
         } catch {
           // Local persistence succeeded
         }
@@ -646,7 +677,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       let vaultData: UserVault | null = db.user_vaults.find(v => v.user_id === state.user!.id) || null;
       let keyData: UserCryptoKey | null = db.user_crypto_keys.find(k => k.user_id === state.user!.id) || null;
 
-      if (!vaultData && isSupabaseConfigured) {
+      if (!vaultData && isSupabaseConfigured && state.storageMode === 'supabase') {
         const { data } = await supabase
           .from('user_vaults')
           .select('*')
@@ -655,7 +686,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (data) vaultData = data as UserVault;
       }
 
-      if (!keyData && isSupabaseConfigured) {
+      if (!keyData && isSupabaseConfigured && state.storageMode === 'supabase') {
         const { data } = await supabase
           .from('user_crypto_keys')
           .select('*')
@@ -728,11 +759,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         recoveryKey.trim()
       );
       const updated = await CryptoService.changePassphrase(vaultKey, newPassphrase);
+      const now = new Date().toISOString();
 
       vaultData.encrypted_vault_key = updated.encryptedVaultKey;
       vaultData.kdf_salt = updated.salt;
-      vaultData.updated_at = new Date().toISOString();
+      vaultData.updated_at = now;
       saveLocalDb(db);
+
+      if (isSupabaseConfigured && state.storageMode === 'supabase') {
+        try {
+          await supabase
+            .from('user_vaults')
+            .update({
+              encrypted_vault_key: updated.encryptedVaultKey,
+              kdf_salt: updated.salt,
+              updated_at: now,
+            })
+            .eq('user_id', state.user.id);
+        } catch {
+          // Local update succeeded
+        }
+      }
 
       const keyData = db.user_crypto_keys.find(k => k.user_id === state.user!.id);
       const privateKey = keyData
@@ -761,12 +808,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     try {
       const updated = await CryptoService.changePassphrase(state.vault.vaultKey, newPassphrase);
+      const now = new Date().toISOString();
       const db = loadLocalDb();
       const vaultData = db.user_vaults.find(v => v.user_id === state.user!.id);
       if (vaultData) {
         vaultData.encrypted_vault_key = updated.encryptedVaultKey;
         vaultData.kdf_salt = updated.salt;
-        vaultData.updated_at = new Date().toISOString();
+        vaultData.updated_at = now;
       }
       db.audit_events.unshift({
         id: crypto.randomUUID(),
@@ -778,9 +826,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         project_id: null,
         outcome: 'success',
         metadata: {},
-        created_at: new Date().toISOString(),
+        created_at: now,
       });
       saveLocalDb(db);
+
+      if (isSupabaseConfigured && state.storageMode === 'supabase') {
+        try {
+          await supabase
+            .from('user_vaults')
+            .update({
+              encrypted_vault_key: updated.encryptedVaultKey,
+              kdf_salt: updated.salt,
+              updated_at: now,
+            })
+            .eq('user_id', state.user.id);
+        } catch {
+          // Local update succeeded
+        }
+      }
+
       return { error: null };
     } catch (err) {
       return { error: err instanceof Error ? err.message : 'Failed to rotate passphrase' };
@@ -807,6 +871,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         updated_at: now,
       };
       saveLocalDb(db);
+      primeProfileCache(db.profiles[profileIdx]);
       setState(s => ({ ...s, profile: db.profiles[profileIdx] }));
     }
 

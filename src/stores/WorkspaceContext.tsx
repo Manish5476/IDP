@@ -62,9 +62,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [userId]
   );
 
+  const activeWorkspaceId = activeWorkspace?.id;
+
   const refreshProjects = useCallback(
     async (selectProjectId?: string) => {
-      if (!activeWorkspace) {
+      if (!activeWorkspaceId) {
         setProjects([]);
         setActiveProjectState(null);
         return;
@@ -72,7 +74,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
       setProjectsLoading(true);
       try {
-        const list = await getProjects(activeWorkspace.id);
+        const list = await getProjects(activeWorkspaceId);
         setProjects(list);
 
         const savedProjId =
@@ -82,19 +84,31 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
             : null);
 
         setActiveProjectState(current => {
+          let chosen: Project | null = null;
           if (selectProjectId) {
-            const explicit = list.find(p => p.id === selectProjectId);
-            if (explicit) return explicit;
+            chosen = list.find(p => p.id === selectProjectId) ?? null;
           }
-          if (current) {
-            const updatedCurrent = list.find(p => p.id === current.id);
-            if (updatedCurrent) return updatedCurrent;
+          if (!chosen && current) {
+            chosen = list.find(p => p.id === current.id) ?? null;
           }
-          if (savedProjId) {
-            const saved = list.find(p => p.id === savedProjId);
-            if (saved) return saved;
+          if (!chosen && savedProjId) {
+            chosen = list.find(p => p.id === savedProjId) ?? null;
           }
-          return list.find(p => p.status === 'active') ?? list[0] ?? null;
+          if (!chosen) {
+            chosen = list.find(p => p.status === 'active') ?? list[0] ?? null;
+          }
+          if (
+            current &&
+            chosen &&
+            current.id === chosen.id &&
+            current.updated_at === chosen.updated_at &&
+            current.status === chosen.status &&
+            current.name === chosen.name &&
+            current.repository_url === chosen.repository_url
+          ) {
+            return current;
+          }
+          return chosen;
         });
       } catch (err) {
         console.error('Failed to load projects:', err);
@@ -102,7 +116,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         setProjectsLoading(false);
       }
     },
-    [activeWorkspace, userId]
+    [activeWorkspaceId, userId]
   );
 
   const refresh = useCallback(async () => {
@@ -126,15 +140,27 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           : null;
 
       setActiveWorkspaceState(current => {
+        let chosen: WorkspaceWithRole | null = null;
         if (current) {
-          const foundCurrent = data.find(w => w.id === current.id);
-          if (foundCurrent) return foundCurrent;
+          chosen = data.find(w => w.id === current.id) ?? null;
         }
-        if (savedWsId) {
-          const foundSaved = data.find(w => w.id === savedWsId);
-          if (foundSaved) return foundSaved;
+        if (!chosen && savedWsId) {
+          chosen = data.find(w => w.id === savedWsId) ?? null;
         }
-        return data[0] ?? null;
+        if (!chosen) {
+          chosen = data[0] ?? null;
+        }
+        if (
+          current &&
+          chosen &&
+          current.id === chosen.id &&
+          current.updated_at === chosen.updated_at &&
+          current.name === chosen.name &&
+          current.member_role === chosen.member_role
+        ) {
+          return current;
+        }
+        return chosen;
       });
     } catch (err) {
       console.error('Failed to load workspaces:', err);
