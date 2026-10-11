@@ -634,3 +634,35 @@ $$;
 REVOKE ALL ON FUNCTION public.delete_project_safe(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.delete_project_safe(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.delete_project_safe(UUID) TO service_role;
+
+-- ─── 6. Add Public Schema Foreign Keys to Profiles (Fixes PGRST200) ─
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'workspace_members_user_id_profiles_fkey'
+  ) THEN
+    ALTER TABLE public.workspace_members
+      ADD CONSTRAINT workspace_members_user_id_profiles_fkey
+      FOREIGN KEY (user_id) REFERENCES public.profiles(id) ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'tasks_assignee_id_profiles_fkey'
+  ) THEN
+    ALTER TABLE public.tasks
+      ADD CONSTRAINT tasks_assignee_id_profiles_fkey
+      FOREIGN KEY (assignee_id) REFERENCES public.profiles(id) ON DELETE SET NULL;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'audit_events_actor_id_profiles_fkey'
+  ) THEN
+    ALTER TABLE public.audit_events
+      ADD CONSTRAINT audit_events_actor_id_profiles_fkey
+      FOREIGN KEY (actor_id) REFERENCES public.profiles(id) ON DELETE SET NULL;
+  END IF;
+END;
+$$;
+
+NOTIFY pgrst, 'reload schema';
+

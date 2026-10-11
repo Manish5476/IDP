@@ -293,6 +293,54 @@ export async function archiveWorkspace(id: string, actorId?: string): Promise<Wo
 
 // ─── Workspace Members ──────────────────────────────────────────────
 
+// ─── Profile Lookup Helper (Prevents PGRST200 on auth.users FK columns) ───
+
+async function resolveProfilesByIds(
+  rawIds: (string | null | undefined)[]
+): Promise<Map<string, Profile>> {
+  const db = loadLocalDb();
+  const profileMap = new Map<string, Profile>();
+
+  for (const p of db.profiles) {
+    profileMap.set(p.id, p);
+  }
+
+  const uniqueIds = Array.from(
+    new Set(rawIds.filter((id): id is string => Boolean(id && id.trim())))
+  );
+
+  if (isSupabaseConfigured && uniqueIds.length > 0) {
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .in('id', uniqueIds);
+      if (!error && data) {
+        let updatedLocal = false;
+        for (const prof of data as Profile[]) {
+          profileMap.set(prof.id, prof);
+          const idx = db.profiles.findIndex(lp => lp.id === prof.id);
+          if (idx >= 0) {
+            db.profiles[idx] = prof;
+          } else {
+            db.profiles.push(prof);
+          }
+          updatedLocal = true;
+        }
+        if (updatedLocal) {
+          saveLocalDb(db);
+        }
+      }
+    } catch {
+      // Fallback to local profileMap
+    }
+  }
+
+  return profileMap;
+}
+
+// ─── Workspace Members ──────────────────────────────────────────────
+
 export async function getWorkspaceMembers(
   workspaceId: string
 ): Promise<(WorkspaceMember & { profile: Profile | null })[]> {
@@ -320,17 +368,28 @@ export async function getWorkspaceMembers(
     try {
       const { data, error } = await supabase
         .from('workspace_members')
-        .select(`
-          *,
-          profile:profiles(*)
-        `)
+        .select('*')
         .eq('workspace_id', workspaceId);
       if (!error && data && data.length > 0) {
-        const remote = (data as (WorkspaceMember & { profile: Profile | null })[]).filter(
+        const rawMembers = (data as WorkspaceMember[]).filter(
           rm =>
             !isIdDeleted(db, rm.id) &&
             !isIdDeleted(db, `ws-member:${workspaceId}:${rm.user_id}`)
         );
+        const profileMap = await resolveProfilesByIds(rawMembers.map(rm => rm.user_id));
+
+        const remote: (WorkspaceMember & { profile: Profile | null })[] = rawMembers.map(rm => ({
+          ...rm,
+          profile: profileMap.get(rm.user_id) || {
+            id: rm.user_id,
+            email: 'member@devportal.io',
+            full_name: 'Workspace Member',
+            avatar_url: null,
+            created_at: rm.joined_at,
+            updated_at: rm.joined_at,
+          },
+        }));
+
         for (const rm of remote) {
           const localMatch = db.workspace_members.find(
             wm => wm.workspace_id === workspaceId && wm.user_id === rm.user_id
@@ -1577,10 +1636,7 @@ export async function getTasks(
     try {
       let query = supabase
         .from('tasks')
-        .select(`
-          *,
-          assignee:profiles!assignee_id(*)
-        `)
+        .select('*')
         .eq('project_id', projectId)
         .order('created_at', { ascending: false });
 
@@ -1589,17 +1645,30 @@ export async function getTasks(
       const { data, error } = await query;
       if (!error && data && data.length > 0) {
         const remote = (data as Task[]).filter(t => !isIdDeleted(db, t.id));
+        const profileMap = await resolveProfilesByIds(remote.map(rt => rt.assignee_id));
         const merged: Task[] = [];
         for (const rt of remote) {
-          const localIdx = db.tasks.findIndex(lt => lt.id === rt.id);
+          const enriched: Task = {
+            ...rt,
+            assignee: rt.assignee_id ? profileMap.get(rt.assignee_id) : undefined,
+          };
+          const localIdx = db.tasks.findIndex(lt => lt.id === enriched.id);
           if (localIdx >= 0) {
             const localTask = db.tasks[localIdx];
-            const chosen = localTask.updated_at > rt.updated_at ? localTask : rt;
+            const chosen =
+              localTask.updated_at > enriched.updated_at
+                ? {
+                    ...localTask,
+                    assignee: localTask.assignee_id
+                      ? profileMap.get(localTask.assignee_id)
+                      : undefined,
+                  }
+                : enriched;
             db.tasks[localIdx] = chosen;
             merged.push(chosen);
           } else {
-            db.tasks.push(rt);
-            merged.push(rt);
+            db.tasks.push(enriched);
+            merged.push(enriched);
           }
         }
         saveLocalDb(db);
@@ -1835,10 +1904,7 @@ export async function getAuditEvents(
     try {
       let query = supabase
         .from('audit_events')
-        .select(`
-          *,
-          actor:profiles!actor_id(*)
-        `)
+        .select('*')
         .order('created_at', { ascending: false })
         .limit(limit);
 
@@ -1846,7 +1912,12 @@ export async function getAuditEvents(
 
       const { data, error } = await query;
       if (!error && data && data.length > 0) {
-        return data as AuditEvent[];
+        const rawEvents = data as AuditEvent[];
+        const profileMap = await resolveProfilesByIds(rawEvents.map(ev => ev.actor_id));
+        return rawEvents.map(ev => ({
+          ...ev,
+          actor: ev.actor_id ? profileMap.get(ev.actor_id) : undefined,
+        }));
       }
     } catch {
       // Return localEvents

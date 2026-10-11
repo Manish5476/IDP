@@ -3520,11 +3520,13 @@ function BranchesPage() {
   );
 }
 
-// ─── Tasks Page (Interactive Kanban Board & List View) ──────────────
+// ─── Tasks Page (Responsive Interactive Kanban Board & List View) ───
 function TasksPage() {
   const { user } = useAuth();
   const { projects, activeProject, setActiveProject, activeWorkspace } = useWorkspace();
   const [view, setView] = useState<'board' | 'list'>('board');
+  const [boardLayout, setBoardLayout] = useState<'grid' | 'swimlane'>('grid');
+  const [activeStageTab, setActiveStageTab] = useState<'all' | TaskStatus>('all');
   const [tasks, setTasks] = useState<Task[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [title, setTitle] = useState('');
@@ -3533,14 +3535,59 @@ function TasksPage() {
   const [status, setStatus] = useState<TaskStatus>('todo');
   const [dueDate, setDueDate] = useState('');
   const [priorityFilter, setPriorityFilter] = useState<'all' | TaskPriority>('all');
+  const [searchQuery, setSearchQuery] = useState('');
 
-  const columns: { id: TaskStatus; title: string; color: string }[] = [
-    { id: 'backlog', title: 'Backlog', color: 'bg-slate-400' },
-    { id: 'todo', title: 'To Do', color: 'bg-blue-500' },
-    { id: 'in_progress', title: 'In Progress', color: 'bg-amber-500' },
-    { id: 'review', title: 'Review', color: 'bg-purple-500' },
-    { id: 'done', title: 'Done', color: 'bg-emerald-500' },
+  // Drag & Drop state
+  const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
+  const [dragOverColumn, setDragOverColumn] = useState<TaskStatus | null>(null);
+
+  // Edit Task state
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [editPriority, setEditPriority] = useState<TaskPriority>('medium');
+  const [editStatus, setEditStatus] = useState<TaskStatus>('todo');
+  const [editDueDate, setEditDueDate] = useState('');
+
+  const columns: { id: TaskStatus; title: string; color: string; ring: string; badgeBg: string }[] = [
+    {
+      id: 'backlog',
+      title: 'Backlog',
+      color: 'bg-slate-400',
+      ring: 'border-slate-300 dark:border-slate-700',
+      badgeBg: 'bg-slate-500/10 text-slate-600 dark:text-slate-300',
+    },
+    {
+      id: 'todo',
+      title: 'To Do',
+      color: 'bg-blue-500',
+      ring: 'border-blue-400/60 dark:border-blue-500/50',
+      badgeBg: 'bg-blue-500/10 text-blue-600 dark:text-blue-400',
+    },
+    {
+      id: 'in_progress',
+      title: 'In Progress',
+      color: 'bg-amber-500',
+      ring: 'border-amber-400/60 dark:border-amber-500/50',
+      badgeBg: 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
+    },
+    {
+      id: 'review',
+      title: 'Review',
+      color: 'bg-purple-500',
+      ring: 'border-purple-400/60 dark:border-purple-500/50',
+      badgeBg: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
+    },
+    {
+      id: 'done',
+      title: 'Done',
+      color: 'bg-emerald-500',
+      ring: 'border-emerald-400/60 dark:border-emerald-500/50',
+      badgeBg: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    },
   ];
+
+  const columnOrder: TaskStatus[] = ['backlog', 'todo', 'in_progress', 'review', 'done'];
 
   const loadTasks = useCallback(async () => {
     if (!activeProject) {
@@ -3555,13 +3602,29 @@ function TasksPage() {
     loadTasks();
   }, [loadTasks]);
 
+  const openQuickAddForColumn = (targetStatus: TaskStatus) => {
+    setStatus(targetStatus);
+    setEditingTask(null);
+    setShowCreate(true);
+  };
+
+  const openEditTaskModal = (task: Task) => {
+    setShowCreate(false);
+    setEditingTask(task);
+    setEditTitle(task.title);
+    setEditDescription(task.description || '');
+    setEditPriority(task.priority);
+    setEditStatus(task.status);
+    setEditDueDate(task.due_date || '');
+  };
+
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeProject || !user || !title.trim()) return;
+    if (!activeProject || !title.trim()) return;
     await createTask(activeProject.id, title.trim(), description.trim() || null, priority, {
       status,
       due_date: dueDate || null,
-      actor_id: user.id,
+      actor_id: user?.id,
     });
     setTitle('');
     setDescription('');
@@ -3570,39 +3633,127 @@ function TasksPage() {
     await loadTasks();
   };
 
-  const handleStatusChange = async (taskId: string, nextStatus: TaskStatus) => {
-    if (!user) return;
-    await updateTask(taskId, { status: nextStatus }, user.id);
+  const handleSaveEditTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTask || !editTitle.trim()) return;
+    await updateTask(
+      editingTask.id,
+      {
+        title: editTitle.trim(),
+        description: editDescription.trim() || null,
+        priority: editPriority,
+        status: editStatus,
+        due_date: editDueDate || null,
+      },
+      user?.id
+    );
+    setEditingTask(null);
     await loadTasks();
+  };
+
+  const handleStatusChange = async (taskId: string, nextStatus: TaskStatus) => {
+    // Optimistically update UI immediately for snappy Kanban feel
+    setTasks(prev =>
+      prev.map(t => (t.id === taskId ? { ...t, status: nextStatus, updated_at: new Date().toISOString() } : t))
+    );
+    await updateTask(taskId, { status: nextStatus }, user?.id);
+    await loadTasks();
+  };
+
+  const handleStepStatus = async (task: Task, direction: -1 | 1) => {
+    const currentIdx = columnOrder.indexOf(task.status);
+    const nextIdx = currentIdx + direction;
+    if (nextIdx < 0 || nextIdx >= columnOrder.length) return;
+    await handleStatusChange(task.id, columnOrder[nextIdx]);
   };
 
   const handleDeleteTask = async (taskId: string) => {
-    if (!user) return;
-    await deleteTask(taskId, user.id);
+    setTasks(prev => prev.filter(t => t.id !== taskId));
+    if (editingTask?.id === taskId) {
+      setEditingTask(null);
+    }
+    await deleteTask(taskId, user?.id);
     await loadTasks();
   };
 
-  const filteredTasks = tasks.filter(t => priorityFilter === 'all' || t.priority === priorityFilter);
+  const handleDragStart = (e: React.DragEvent, taskId: string) => {
+    setDraggedTaskId(taskId);
+    e.dataTransfer.setData('text/plain', taskId);
+    e.dataTransfer.effectAllowed = 'move';
+  };
+
+  const handleDragOver = (e: React.DragEvent, colId: TaskStatus) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (dragOverColumn !== colId) {
+      setDragOverColumn(colId);
+    }
+  };
+
+  const handleDropOnColumn = async (e: React.DragEvent, targetStatus: TaskStatus) => {
+    e.preventDefault();
+    const taskId = e.dataTransfer.getData('text/plain') || draggedTaskId;
+    setDraggedTaskId(null);
+    setDragOverColumn(null);
+    if (!taskId) return;
+    const existing = tasks.find(t => t.id === taskId);
+    if (existing && existing.status !== targetStatus) {
+      await handleStatusChange(taskId, targetStatus);
+    }
+  };
+
+  const filteredTasks = tasks.filter(t => {
+    const matchesPriority = priorityFilter === 'all' || t.priority === priorityFilter;
+    const matchesSearch =
+      !searchQuery.trim() ||
+      t.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (t.description || '').toLowerCase().includes(searchQuery.toLowerCase());
+    return matchesPriority && matchesSearch;
+  });
+
+  const visibleColumns =
+    activeStageTab === 'all' ? columns : columns.filter(c => c.id === activeStageTab);
+
+  const totalCount = tasks.length;
+  const doneCount = tasks.filter(t => t.status === 'done').length;
+  const inProgressCount = tasks.filter(t => t.status === 'in_progress' || t.status === 'review').length;
+  const urgentCount = tasks.filter(t => (t.priority === 'critical' || t.priority === 'high') && t.status !== 'done').length;
+  const completionPct = totalCount > 0 ? Math.round((doneCount / totalCount) * 100) : 0;
 
   const priorityBadge: Record<TaskPriority, string> = {
-    low: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400',
-    medium: 'bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300',
-    high: 'bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300',
-    critical: 'bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-300',
+    low: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200/70 dark:border-slate-700',
+    medium: 'bg-blue-500/15 text-blue-600 dark:text-blue-300 border border-blue-500/25',
+    high: 'bg-amber-500/15 text-amber-600 dark:text-amber-300 border border-amber-500/30',
+    critical: 'bg-red-500/15 text-red-600 dark:text-red-300 border border-red-500/30',
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+    <div className="space-y-5">
+      {/* Header + Controls */}
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Tasks</h1>
           <p className="text-slate-500 dark:text-slate-400 text-sm mt-1">
-            Kanban workflow and sprint tasks for {activeProject?.name || 'your project'}
+            Kanban workflow and sprint tasks for {activeProject?.name || 'your project'} — drag cards or use quick stage controls
           </p>
         </div>
+
         <div className="flex flex-wrap items-center gap-2.5">
+          {/* Search Input */}
+          <div className="relative flex-1 sm:flex-initial min-w-[180px]">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              placeholder="Filter tasks..."
+              className="w-full pl-8 pr-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+
           {projects.length > 0 && (
             <select
+              aria-label="Select project for tasks"
               value={activeProject?.id || ''}
               onChange={e => setActiveProject(projects.find(p => p.id === e.target.value) || null)}
               className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-semibold text-slate-800 dark:text-white"
@@ -3614,7 +3765,9 @@ function TasksPage() {
               ))}
             </select>
           )}
+
           <select
+            aria-label="Filter by priority"
             value={priorityFilter}
             onChange={e => setPriorityFilter(e.target.value as 'all' | TaskPriority)}
             className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs text-slate-700 dark:text-slate-300"
@@ -3625,8 +3778,39 @@ function TasksPage() {
             <option value="medium">Medium</option>
             <option value="low">Low</option>
           </select>
+
+          {view === 'board' && (
+            <div className="hidden md:flex rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden bg-white dark:bg-slate-900">
+              <button
+                type="button"
+                onClick={() => setBoardLayout('grid')}
+                className={`px-2.5 py-1.5 text-xs font-medium transition ${
+                  boardLayout === 'grid'
+                    ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+                title="Responsive multi-row grid"
+              >
+                Wrap Grid
+              </button>
+              <button
+                type="button"
+                onClick={() => setBoardLayout('swimlane')}
+                className={`px-2.5 py-1.5 text-xs font-medium transition ${
+                  boardLayout === 'swimlane'
+                    ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+                title="Horizontal scrollable 5-column swimlane"
+              >
+                Swimlane
+              </button>
+            </div>
+          )}
+
           <div className="flex rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden bg-white dark:bg-slate-900">
             <button
+              type="button"
               onClick={() => setView('board')}
               className={`px-3 py-1.5 text-xs font-medium ${
                 view === 'board'
@@ -3637,6 +3821,7 @@ function TasksPage() {
               Board
             </button>
             <button
+              type="button"
               onClick={() => setView('list')}
               className={`px-3 py-1.5 text-xs font-medium ${
                 view === 'list'
@@ -3647,22 +3832,106 @@ function TasksPage() {
               List
             </button>
           </div>
+
           <button
-            onClick={() => setShowCreate(true)}
+            type="button"
+            onClick={() => {
+              setEditingTask(null);
+              setShowCreate(true);
+            }}
             disabled={!activeProject}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium transition disabled:opacity-50"
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold transition disabled:opacity-50 shadow-sm"
           >
             <Plus className="w-4 h-4" /> New Task
           </button>
         </div>
       </div>
 
+      {/* Sprint Progress & Responsive Stage Pill Bar */}
+      <div className="bg-white dark:bg-slate-900/90 rounded-2xl border border-slate-200/80 dark:border-slate-800 p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+        <div className="flex flex-wrap items-center gap-4 sm:gap-6">
+          <div className="min-w-[160px]">
+            <div className="flex items-center justify-between text-xs mb-1.5">
+              <span className="font-semibold text-slate-600 dark:text-slate-400">Sprint Progress</span>
+              <span className="font-bold text-slate-900 dark:text-white">{completionPct}%</span>
+            </div>
+            <div className="w-full h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-emerald-500 transition-all duration-300"
+                style={{ width: `${completionPct}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 text-xs">
+            <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium">
+              Total: <strong>{totalCount}</strong>
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-amber-500/10 text-amber-600 dark:text-amber-400 font-medium">
+              Active: <strong>{inProgressCount}</strong>
+            </span>
+            {urgentCount > 0 && (
+              <span className="px-2.5 py-1 rounded-lg bg-red-500/10 text-red-600 dark:text-red-400 font-medium">
+                High/Critical: <strong>{urgentCount}</strong>
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Stage Filter Pills (Great for mobile/tablet focus or quick column filtering) */}
+        <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+          <button
+            type="button"
+            onClick={() => setActiveStageTab('all')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-semibold whitespace-nowrap transition ${
+              activeStageTab === 'all'
+                ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900 shadow-xs'
+                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200/70 dark:hover:bg-slate-700'
+            }`}
+          >
+            All Stages ({filteredTasks.length})
+          </button>
+          {columns.map(col => {
+            const count = filteredTasks.filter(t => t.status === col.id).length;
+            const active = activeStageTab === col.id;
+            return (
+              <button
+                key={col.id}
+                type="button"
+                onClick={() => setActiveStageTab(active ? 'all' : col.id)}
+                className={`px-3 py-1.5 rounded-xl text-xs font-semibold whitespace-nowrap flex items-center gap-1.5 transition ${
+                  active
+                    ? 'bg-indigo-600 text-white shadow-xs'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200/70 dark:hover:bg-slate-700'
+                }`}
+              >
+                <span className={`w-2 h-2 rounded-full ${col.color}`} />
+                {col.title}
+                <span className="opacity-75">({count})</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Create Task Form */}
       {showCreate && activeProject && (
         <form
           onSubmit={handleCreateTask}
           className="bg-white dark:bg-slate-900 rounded-2xl border border-indigo-200 dark:border-indigo-900 p-6 shadow-md space-y-4"
         >
-          <h3 className="font-semibold text-slate-900 dark:text-white">Create Task in {activeProject.name}</h3>
+          <div className="flex items-center justify-between">
+            <h3 className="font-semibold text-slate-900 dark:text-white">
+              Create Task in {activeProject.name}
+            </h3>
+            <button
+              type="button"
+              onClick={() => setShowCreate(false)}
+              className="p-1 rounded-lg text-slate-400 hover:text-slate-600"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="md:col-span-2">
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Task Title *</label>
@@ -3699,7 +3968,7 @@ function TasksPage() {
               </select>
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Initial Column</label>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Column</label>
               <select
                 value={status}
                 onChange={e => setStatus(e.target.value as TaskStatus)}
@@ -3731,81 +4000,280 @@ function TasksPage() {
             >
               Cancel
             </button>
-            <button type="submit" className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-xs font-medium">
+            <button type="submit" className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold">
               Create Task
             </button>
           </div>
         </form>
       )}
 
+      {/* Edit Task Modal / Panel */}
+      {editingTask && (
+        <form
+          onSubmit={handleSaveEditTask}
+          className="bg-white dark:bg-slate-900 rounded-2xl border-2 border-indigo-500/70 dark:border-indigo-500/60 p-6 shadow-lg space-y-4"
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Edit3 className="w-4 h-4 text-indigo-500" />
+              <h3 className="font-semibold text-slate-900 dark:text-white">Edit Task</h3>
+            </div>
+            <button
+              type="button"
+              onClick={() => setEditingTask(null)}
+              className="p-1 rounded-lg text-slate-400 hover:text-slate-600"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="md:col-span-2">
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Task Title *</label>
+              <input
+                required
+                value={editTitle}
+                onChange={e => setEditTitle(e.target.value)}
+                className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Due Date</label>
+              <input
+                type="date"
+                value={editDueDate}
+                onChange={e => setEditDueDate(e.target.value)}
+                className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Priority</label>
+              <select
+                value={editPriority}
+                onChange={e => setEditPriority(e.target.value as TaskPriority)}
+                className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white"
+              >
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Column Status</label>
+              <select
+                value={editStatus}
+                onChange={e => setEditStatus(e.target.value as TaskStatus)}
+                className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white"
+              >
+                {columns.map(c => (
+                  <option key={c.id} value={c.id}>
+                    {c.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Description</label>
+            <textarea
+              rows={2}
+              value={editDescription}
+              onChange={e => setEditDescription(e.target.value)}
+              className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setEditingTask(null)}
+              className="px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-700 text-xs text-slate-700 dark:text-slate-300"
+            >
+              Cancel
+            </button>
+            <button type="submit" className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold">
+              Save Task Changes
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* Kanban Board or List View */}
       {view === 'board' ? (
-        <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
-          {columns.map(col => {
+        <div
+          className={
+            activeStageTab !== 'all'
+              ? 'grid grid-cols-1 max-w-2xl gap-4'
+              : boardLayout === 'swimlane'
+                ? 'flex overflow-x-auto pb-4 gap-4 snap-x snap-mandatory'
+                : 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5 gap-4 items-start'
+          }
+        >
+          {visibleColumns.map(col => {
             const colTasks = filteredTasks.filter(t => t.status === col.id);
+            const isDropTarget = dragOverColumn === col.id;
             return (
               <div
                 key={col.id}
-                className="bg-slate-100/90 dark:bg-slate-900/60 border border-slate-200/70 dark:border-slate-800 rounded-2xl p-3 flex flex-col"
+                onDragOver={e => handleDragOver(e, col.id)}
+                onDragLeave={() => setDragOverColumn(prev => (prev === col.id ? null : prev))}
+                onDrop={e => handleDropOnColumn(e, col.id)}
+                className={`rounded-2xl p-3.5 flex flex-col transition-all ${
+                  boardLayout === 'swimlane' && activeStageTab === 'all'
+                    ? 'min-w-[285px] sm:min-w-[310px] flex-1 snap-start'
+                    : 'w-full'
+                } ${
+                  isDropTarget
+                    ? 'bg-indigo-50/90 dark:bg-indigo-950/40 border-2 border-indigo-500 ring-4 ring-indigo-500/10'
+                    : 'bg-slate-100/90 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-800/90'
+                }`}
               >
-                <div className="flex items-center gap-2 mb-3 px-1">
-                  <div className={`w-2.5 h-2.5 rounded-full ${col.color}`} />
-                  <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">{col.title}</span>
-                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-white dark:bg-slate-800 text-slate-500 ml-auto">
-                    {colTasks.length}
-                  </span>
+                {/* Column Header */}
+                <div className="flex items-center justify-between gap-2 mb-3.5 px-1">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${col.color}`} />
+                    <span className="text-xs font-bold tracking-tight text-slate-800 dark:text-slate-100 truncate">
+                      {col.title}
+                    </span>
+                    <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200/60 dark:border-slate-700/70">
+                      {colTasks.length}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => openQuickAddForColumn(col.id)}
+                    title={`Add task to ${col.title}`}
+                    className="p-1 rounded-lg hover:bg-white dark:hover:bg-slate-800 text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                  </button>
                 </div>
-                <div className="space-y-2.5 flex-1 min-h-[140px]">
+
+                {/* Column Cards */}
+                <div className="space-y-3 flex-1 min-h-[160px]">
                   {colTasks.length === 0 ? (
-                    <div className="p-4 rounded-xl border border-dashed border-slate-200 dark:border-slate-800 text-xs text-slate-400 text-center">
-                      No tasks
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => openQuickAddForColumn(col.id)}
+                      className="w-full h-32 rounded-xl border border-dashed border-slate-200 dark:border-slate-800 hover:border-indigo-400/60 dark:hover:border-indigo-500/50 text-xs text-slate-400 hover:text-indigo-500 flex flex-col items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4 opacity-60" />
+                      <span>No tasks — click or drop here</span>
+                    </button>
                   ) : (
-                    colTasks.map(task => (
-                      <div
-                        key={task.id}
-                        className="p-3.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xs space-y-2"
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <span
-                            className={`text-[10px] px-2 py-0.5 rounded-full font-semibold uppercase ${priorityBadge[task.priority]}`}
-                          >
-                            {task.priority}
-                          </span>
-                          <button
-                            onClick={() => handleDeleteTask(task.id)}
-                            className="text-slate-400 hover:text-red-500"
-                            title="Delete task"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                    colTasks.map(task => {
+                      const colIdx = columnOrder.indexOf(task.status);
+                      const canStepBack = colIdx > 0;
+                      const canStepForward = colIdx < columnOrder.length - 1;
+                      return (
+                        <div
+                          key={task.id}
+                          draggable
+                          onDragStart={e => handleDragStart(e, task.id)}
+                          onDragEnd={() => {
+                            setDraggedTaskId(null);
+                            setDragOverColumn(null);
+                          }}
+                          className={`p-4 rounded-xl bg-white dark:bg-[#16191D] border border-slate-200/90 dark:border-slate-800 hover:border-indigo-400/60 dark:hover:border-slate-700 shadow-xs hover:shadow-md transition-all space-y-2.5 cursor-grab active:cursor-grabbing ${
+                            draggedTaskId === task.id ? 'opacity-50 scale-[0.98]' : ''
+                          }`}
+                        >
+                          {/* Top Row: Priority Badge + Edit / Delete Actions */}
+                          <div className="flex items-center justify-between gap-2">
+                            <span
+                              className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase tracking-wider ${priorityBadge[task.priority]}`}
+                            >
+                              {task.priority}
+                            </span>
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => openEditTaskModal(task)}
+                                className="p-1 rounded-md text-slate-400 hover:text-indigo-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                                title="Edit task"
+                              >
+                                <Edit3 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteTask(task.id)}
+                                className="p-1 rounded-md text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/50 transition"
+                                title="Delete task"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Title & Description */}
+                          <div>
+                            <p className="text-sm font-bold text-slate-900 dark:text-white leading-snug break-words">
+                              {task.title}
+                            </p>
+                            {task.description && (
+                              <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2 mt-1 leading-relaxed break-words">
+                                {task.description}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Due Date & Assignee */}
+                          {(task.due_date || task.assignee) && (
+                            <div className="flex items-center justify-between gap-2 pt-0.5 text-[11px] text-slate-400">
+                              {task.due_date ? (
+                                <span className="inline-flex items-center gap-1 font-mono bg-slate-100 dark:bg-slate-800/80 px-2 py-0.5 rounded-md text-slate-600 dark:text-slate-300">
+                                  <Clock className="w-3 h-3" /> {task.due_date}
+                                </span>
+                              ) : (
+                                <span />
+                              )}
+                              {task.assignee?.full_name && (
+                                <span className="truncate max-w-[120px] font-medium text-slate-500 dark:text-slate-400">
+                                  {task.assignee.full_name}
+                                </span>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Responsive Stage Footer: Prev / Dropdown / Next */}
+                          <div className="pt-2.5 border-t border-slate-100 dark:border-slate-800/80 flex items-center justify-between gap-1.5">
+                            <button
+                              type="button"
+                              disabled={!canStepBack}
+                              onClick={() => handleStepStatus(task, -1)}
+                              title={canStepBack ? `Move back to ${columns[colIdx - 1].title}` : 'First stage'}
+                              className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 disabled:opacity-30 disabled:pointer-events-none transition"
+                            >
+                              <ChevronLeft className="w-3.5 h-3.5" />
+                            </button>
+
+                            <select
+                              aria-label="Change task stage"
+                              value={task.status}
+                              onChange={e => handleStatusChange(task.id, e.target.value as TaskStatus)}
+                              className="flex-1 min-w-0 text-[11px] font-semibold bg-slate-50 dark:bg-slate-800/90 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1 text-slate-700 dark:text-slate-200 outline-none focus:ring-1 focus:ring-indigo-500"
+                            >
+                              {columns.map(c => (
+                                <option key={c.id} value={c.id}>
+                                  {c.title}
+                                </option>
+                              ))}
+                            </select>
+
+                            <button
+                              type="button"
+                              disabled={!canStepForward}
+                              onClick={() => handleStepStatus(task, 1)}
+                              title={canStepForward ? `Advance to ${columns[colIdx + 1].title}` : 'Completed'}
+                              className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 text-slate-600 dark:text-slate-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/60 hover:text-indigo-600 dark:hover:text-indigo-400 disabled:opacity-30 disabled:pointer-events-none transition"
+                            >
+                              <ChevronRight className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
-                        <p className="text-xs font-semibold text-slate-900 dark:text-white leading-snug">
-                          {task.title}
-                        </p>
-                        {task.description && (
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-2">
-                            {task.description}
-                          </p>
-                        )}
-                        {task.due_date && (
-                          <p className="text-[10px] text-slate-400 font-mono">Due: {task.due_date}</p>
-                        )}
-                        <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
-                          <span className="text-[10px] text-slate-400">Move to:</span>
-                          <select
-                            value={task.status}
-                            onChange={e => handleStatusChange(task.id, e.target.value as TaskStatus)}
-                            className="text-[11px] bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-1.5 py-0.5 text-slate-700 dark:text-slate-300"
-                          >
-                            {columns.map(c => (
-                              <option key={c.id} value={c.id}>
-                                {c.title}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -3821,20 +4289,32 @@ function TasksPage() {
           ) : (
             <div className="divide-y divide-slate-100 dark:divide-slate-800">
               {filteredTasks.map(task => (
-                <div key={task.id} className="p-4 flex items-center justify-between gap-4">
-                  <div>
-                    <div className="flex items-center gap-2">
+                <div key={task.id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold uppercase ${priorityBadge[task.priority]}`}>
                         {task.priority}
                       </span>
                       <span className="text-sm font-semibold text-slate-900 dark:text-white">{task.title}</span>
+                      {task.due_date && (
+                        <span className="text-xs font-mono text-slate-400">Due: {task.due_date}</span>
+                      )}
                     </div>
                     {task.description && (
                       <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{task.description}</p>
                     )}
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => openEditTaskModal(task)}
+                      className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-indigo-600"
+                      title="Edit task"
+                    >
+                      <Edit3 className="w-4 h-4" />
+                    </button>
                     <select
+                      aria-label="Task status"
                       value={task.status}
                       onChange={e => handleStatusChange(task.id, e.target.value as TaskStatus)}
                       className="text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-2.5 py-1.5 text-slate-800 dark:text-white"
@@ -3846,8 +4326,10 @@ function TasksPage() {
                       ))}
                     </select>
                     <button
+                      type="button"
                       onClick={() => handleDeleteTask(task.id)}
                       className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-950 text-slate-400 hover:text-red-600"
+                      title="Delete task"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>

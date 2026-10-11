@@ -74,68 +74,88 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const openVaultModal = useCallback(() => setIsVaultModalOpen(true), []);
   const closeVaultModal = useCallback(() => setIsVaultModalOpen(false), []);
+  const hydrationCacheRef = React.useRef<{ userId: string; timestamp: number; inFlight: boolean }>({
+    userId: '',
+    timestamp: 0,
+    inFlight: false,
+  });
 
-  const hydrateUserContext = useCallback(async (user: User, mode: 'supabase' | 'local') => {
-    const email = user.email || 'developer@devportal.local';
-    const metaName = (user.user_metadata?.full_name as string | undefined) || null;
-
-    // Always ensure local user-scoped provisioning exists as fallback/sync
-    const localProfile = ensureUserProvisioned(user.id, email, metaName);
-    let resolvedProfile: Profile = localProfile;
-
-    if (mode === 'supabase' && isSupabaseConfigured) {
-      try {
-        const { data, error } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', user.id)
-          .maybeSingle();
-        if (!error && data) {
-          resolvedProfile = data as Profile;
-        }
-      } catch {
-        // Fallback to local profile
-      }
+  const hydrateUserContext = useCallback(async (user: User, mode: 'supabase' | 'local', force = false) => {
+    const nowMs = Date.now();
+    if (
+      !force &&
+      hydrationCacheRef.current.userId === user.id &&
+      (hydrationCacheRef.current.inFlight || nowMs - hydrationCacheRef.current.timestamp < 4000)
+    ) {
+      return;
     }
+    hydrationCacheRef.current = { userId: user.id, timestamp: nowMs, inFlight: true };
 
-    // Check vault initialization status in Supabase or localDb
-    const db = loadLocalDb();
-    let localVault = db.user_vaults.find(v => v.user_id === user.id) || null;
+    try {
+      const email = user.email || 'developer@devportal.local';
+      const metaName = (user.user_metadata?.full_name as string | undefined) || null;
 
-    if (mode === 'supabase' && isSupabaseConfigured) {
-      try {
-        const { data, error } = await supabase
-          .from('user_vaults')
-          .select('*')
-          .eq('user_id', user.id)
-          .maybeSingle();
-        if (!error && data) {
-          localVault = data as UserVault;
-          // Sync to localDb so offline/hybrid access works
-          const existingIdx = db.user_vaults.findIndex(v => v.user_id === user.id);
-          if (existingIdx >= 0) db.user_vaults[existingIdx] = localVault;
-          else db.user_vaults.push(localVault);
-          saveLocalDb(db);
+      // Always ensure local user-scoped provisioning exists as fallback/sync
+      const localProfile = ensureUserProvisioned(user.id, email, metaName);
+      let resolvedProfile: Profile = localProfile;
+
+      if (mode === 'supabase' && isSupabaseConfigured) {
+        try {
+          const { data, error } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', user.id)
+            .maybeSingle();
+          if (!error && data) {
+            resolvedProfile = data as Profile;
+          }
+        } catch {
+          // Fallback to local profile
         }
-      } catch {
-        // Use localVault
       }
+
+      // Check vault initialization status in Supabase or localDb
+      const db = loadLocalDb();
+      let localVault = db.user_vaults.find(v => v.user_id === user.id) || null;
+
+      if (mode === 'supabase' && isSupabaseConfigured) {
+        try {
+          const { data, error } = await supabase
+            .from('user_vaults')
+            .select('*')
+            .eq('user_id', user.id)
+            .maybeSingle();
+          if (!error && data) {
+            localVault = data as UserVault;
+            // Sync to localDb so offline/hybrid access works
+            const existingIdx = db.user_vaults.findIndex(v => v.user_id === user.id);
+            if (existingIdx >= 0) db.user_vaults[existingIdx] = localVault;
+            else db.user_vaults.push(localVault);
+            saveLocalDb(db);
+          }
+        } catch {
+          // Use localVault
+        }
+      }
+
+      const isVaultInit = Boolean(localVault);
+
+      setState(s => ({
+        ...s,
+        user,
+        profile: resolvedProfile,
+        vault: {
+          ...s.vault,
+          isInitialized: isVaultInit,
+        },
+        isOnboarded: isVaultInit,
+        isLoading: false,
+        storageMode: mode,
+      }));
+    } finally {
+      hydrationCacheRef.current.inFlight = false;
+      hydrationCacheRef.current.timestamp = Date.now();
     }
-
-    const isVaultInit = Boolean(localVault);
-
-    setState(s => ({
-      ...s,
-      user,
-      profile: resolvedProfile,
-      vault: {
-        ...s.vault,
-        isInitialized: isVaultInit,
-      },
-      isOnboarded: isVaultInit,
-      isLoading: false,
-      storageMode: mode,
-    }));
   }, []);
 
   useEffect(() => {
@@ -181,10 +201,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     initSession();
 
     if (isSupabaseConfigured) {
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-        if (session?.user) {
+      const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+        if (session?.user && (event === 'SIGNED_IN' || event === 'USER_UPDATED')) {
           setState(s => ({ ...s, session }));
-          hydrateUserContext(session.user, 'supabase');
+          hydrateUserContext(session.user, 'supabase', event === 'USER_UPDATED');
         }
       });
       return () => {
