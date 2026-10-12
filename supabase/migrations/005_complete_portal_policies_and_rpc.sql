@@ -664,5 +664,151 @@ BEGIN
 END;
 $$;
 
+-- ─── 7. Email Identities & Subscriptions Vault (Zero-Knowledge AES-256-GCM) ─
+CREATE TABLE IF NOT EXISTS public.email_identities (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  alias_label TEXT NOT NULL DEFAULT 'Primary Email',
+  provider TEXT NOT NULL DEFAULT 'Custom',
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+  encrypted_payload TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  crypto_version TEXT NOT NULL DEFAULT '1',
+  key_version INT NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_identities_workspace ON public.email_identities(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_email_identities_user ON public.email_identities(user_id);
+
+ALTER TABLE public.email_identities ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "email_identities_select" ON public.email_identities;
+CREATE POLICY "email_identities_select" ON public.email_identities
+  FOR SELECT USING (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer', 'viewer']::TEXT[]
+    )
+  );
+
+DROP POLICY IF EXISTS "email_identities_insert" ON public.email_identities;
+CREATE POLICY "email_identities_insert" ON public.email_identities
+  FOR INSERT WITH CHECK (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  );
+
+DROP POLICY IF EXISTS "email_identities_update" ON public.email_identities;
+CREATE POLICY "email_identities_update" ON public.email_identities
+  FOR UPDATE
+  USING (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  )
+  WITH CHECK (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  );
+
+DROP POLICY IF EXISTS "email_identities_delete" ON public.email_identities;
+CREATE POLICY "email_identities_delete" ON public.email_identities
+  FOR DELETE USING (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  );
+
+CREATE TABLE IF NOT EXISTS public.email_subscriptions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email_identity_id UUID NOT NULL REFERENCES public.email_identities(id) ON DELETE CASCADE,
+  workspace_id UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  project_id UUID REFERENCES public.projects(id) ON DELETE SET NULL,
+  service_name TEXT NOT NULL,
+  service_url TEXT,
+  category TEXT NOT NULL DEFAULT 'other',
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'trial', 'free', 'paused', 'cancelled')),
+  billing_cycle TEXT NOT NULL DEFAULT 'monthly' CHECK (billing_cycle IN ('monthly', 'yearly', 'one_time', 'free')),
+  cost_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  renewal_date DATE,
+  encrypted_payload TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  crypto_version TEXT NOT NULL DEFAULT '1',
+  key_version INT NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_subscriptions_identity ON public.email_subscriptions(email_identity_id);
+CREATE INDEX IF NOT EXISTS idx_email_subscriptions_workspace ON public.email_subscriptions(workspace_id);
+
+ALTER TABLE public.email_subscriptions ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "email_subscriptions_select" ON public.email_subscriptions;
+CREATE POLICY "email_subscriptions_select" ON public.email_subscriptions
+  FOR SELECT USING (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer', 'viewer']::TEXT[]
+    )
+  );
+
+DROP POLICY IF EXISTS "email_subscriptions_insert" ON public.email_subscriptions;
+CREATE POLICY "email_subscriptions_insert" ON public.email_subscriptions
+  FOR INSERT WITH CHECK (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  );
+
+DROP POLICY IF EXISTS "email_subscriptions_update" ON public.email_subscriptions;
+CREATE POLICY "email_subscriptions_update" ON public.email_subscriptions
+  FOR UPDATE
+  USING (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  )
+  WITH CHECK (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  );
+
+DROP POLICY IF EXISTS "email_subscriptions_delete" ON public.email_subscriptions;
+CREATE POLICY "email_subscriptions_delete" ON public.email_subscriptions
+  FOR DELETE USING (
+    user_id = (SELECT auth.uid())
+    OR public.has_workspace_role(
+      workspace_id,
+      ARRAY['owner', 'admin', 'developer']::TEXT[]
+    )
+  );
+
 NOTIFY pgrst, 'reload schema';
+
 

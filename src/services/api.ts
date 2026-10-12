@@ -25,6 +25,11 @@ import type {
   EnvironmentType,
   TaskStatus,
   TaskPriority,
+  EmailIdentity,
+  EmailSubscription,
+  SubscriptionCategory,
+  SubscriptionStatus,
+  BillingCycle,
 } from '@/types';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -2171,3 +2176,543 @@ export async function updateIntegrationStatus(
 
   return record;
 }
+
+// ─── Email Identities & Subscriptions Vault (Zero-Knowledge AES-256-GCM) ────
+
+let emailVaultRemoteAvailable = true;
+
+function isMissingRemoteTableError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  const code = error.code || '';
+  const msg = (error.message || '').toLowerCase();
+  return (
+    code === 'PGRST205' ||
+    code === '42P01' ||
+    msg.includes('schema cache') ||
+    msg.includes('does not exist')
+  );
+}
+
+export async function getEmailIdentities(
+  workspaceId: string,
+  userId: string
+): Promise<EmailIdentity[]> {
+  const db = loadLocalDb();
+
+  if (emailVaultRemoteAvailable && canUseSupabase(workspaceId) && isUuid(userId)) {
+    try {
+      const { data, error } = await supabase
+        .from('email_identities')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .order('created_at', { ascending: false });
+
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      } else if (!error && data) {
+        let changed = false;
+        for (const remote of data as EmailIdentity[]) {
+          if (isIdDeleted(db, remote.id)) continue;
+          const idx = db.email_identities.findIndex(item => item.id === remote.id);
+          if (idx >= 0) {
+            db.email_identities[idx] = remote;
+          } else {
+            db.email_identities.push(remote);
+          }
+          changed = true;
+        }
+        if (changed) saveLocalDb(db);
+      }
+    } catch {
+      // Fallback to localDb
+    }
+  }
+
+  return db.email_identities
+    .filter(
+      item =>
+        (item.workspace_id === workspaceId || item.user_id === userId) &&
+        !isIdDeleted(db, item.id)
+    )
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+}
+
+export async function createEmailIdentity(input: {
+  workspaceId: string;
+  userId: string;
+  email: string;
+  aliasLabel: string;
+  provider: string;
+  encryptedPayload: string;
+  nonce: string;
+  cryptoVersion?: string;
+  keyVersion?: number;
+}): Promise<EmailIdentity> {
+  const now = new Date().toISOString();
+  const db = loadLocalDb();
+  const id = crypto.randomUUID();
+
+  let record: EmailIdentity = {
+    id,
+    workspace_id: input.workspaceId,
+    user_id: input.userId,
+    email: input.email.trim().toLowerCase(),
+    alias_label: input.aliasLabel.trim() || 'Primary Email',
+    provider: input.provider.trim() || 'Custom',
+    status: 'active',
+    encrypted_payload: input.encryptedPayload,
+    nonce: input.nonce,
+    crypto_version: input.cryptoVersion || '1',
+    key_version: input.keyVersion ?? 1,
+    created_at: now,
+    updated_at: now,
+  };
+
+  if (emailVaultRemoteAvailable && canUseSupabase(input.workspaceId) && isUuid(input.userId)) {
+    try {
+      const { data, error } = await supabase
+        .from('email_identities')
+        .insert({
+          id: record.id,
+          workspace_id: record.workspace_id,
+          user_id: record.user_id,
+          email: record.email,
+          alias_label: record.alias_label,
+          provider: record.provider,
+          status: record.status,
+          encrypted_payload: record.encrypted_payload,
+          nonce: record.nonce,
+          crypto_version: record.crypto_version,
+          key_version: record.key_version,
+        })
+        .select()
+        .single();
+
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      } else if (!error && data) {
+        record = data as EmailIdentity;
+      }
+    } catch {
+      // Fallback to local record
+    }
+  }
+
+  db.email_identities.unshift(record);
+  saveLocalDb(db);
+
+  await logAuditEvent({
+    actor_id: input.userId,
+    action: 'email_identity.created',
+    resource_type: 'email_identity',
+    resource_id: record.id,
+    workspace_id: input.workspaceId,
+    outcome: 'success',
+    metadata: { email: record.email, provider: record.provider, encrypted: true },
+  });
+
+  return record;
+}
+
+export async function updateEmailIdentity(
+  identityId: string,
+  updates: Partial<
+    Pick<
+      EmailIdentity,
+      | 'email'
+      | 'alias_label'
+      | 'provider'
+      | 'status'
+      | 'encrypted_payload'
+      | 'nonce'
+      | 'crypto_version'
+      | 'key_version'
+    >
+  >,
+  actorId?: string
+): Promise<EmailIdentity> {
+  const now = new Date().toISOString();
+  const db = loadLocalDb();
+  const idx = db.email_identities.findIndex(item => item.id === identityId);
+  if (idx < 0) {
+    throw new Error('Email identity not found');
+  }
+
+  const existing = db.email_identities[idx];
+  const updated: EmailIdentity = {
+    ...existing,
+    ...updates,
+    email: updates.email !== undefined ? updates.email.trim().toLowerCase() : existing.email,
+    alias_label:
+      updates.alias_label !== undefined ? updates.alias_label.trim() : existing.alias_label,
+    provider: updates.provider !== undefined ? updates.provider.trim() : existing.provider,
+    updated_at: now,
+  };
+
+  db.email_identities[idx] = updated;
+  saveLocalDb(db);
+
+  if (emailVaultRemoteAvailable && canUseSupabase(identityId)) {
+    try {
+      const { error } = await supabase
+        .from('email_identities')
+        .update({
+          ...updates,
+          email: updated.email,
+          alias_label: updated.alias_label,
+          provider: updated.provider,
+          updated_at: now,
+        })
+        .eq('id', identityId);
+
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      }
+    } catch {
+      // Local update already persisted
+    }
+  }
+
+  if (actorId) {
+    await logAuditEvent({
+      actor_id: actorId,
+      action: 'email_identity.updated',
+      resource_type: 'email_identity',
+      resource_id: identityId,
+      workspace_id: updated.workspace_id,
+      outcome: 'success',
+      metadata: { email: updated.email, encrypted: true },
+    });
+  }
+
+  return updated;
+}
+
+export async function deleteEmailIdentity(
+  identityId: string,
+  actorId?: string
+): Promise<void> {
+  const db = loadLocalDb();
+  const existing = db.email_identities.find(item => item.id === identityId);
+  const childSubs = db.email_subscriptions.filter(sub => sub.email_identity_id === identityId);
+
+  markIdDeleted(db, identityId);
+  for (const sub of childSubs) {
+    markIdDeleted(db, sub.id);
+  }
+
+  db.email_identities = db.email_identities.filter(item => item.id !== identityId);
+  db.email_subscriptions = db.email_subscriptions.filter(
+    sub => sub.email_identity_id !== identityId
+  );
+  saveLocalDb(db);
+
+  if (emailVaultRemoteAvailable && canUseSupabase(identityId)) {
+    try {
+      await supabase.from('email_subscriptions').delete().eq('email_identity_id', identityId);
+      const { error } = await supabase.from('email_identities').delete().eq('id', identityId);
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      }
+    } catch {
+      // Local deletion already persisted
+    }
+  }
+
+  if (actorId) {
+    await logAuditEvent({
+      actor_id: actorId,
+      action: 'email_identity.deleted',
+      resource_type: 'email_identity',
+      resource_id: identityId,
+      workspace_id: existing?.workspace_id,
+      outcome: 'success',
+      metadata: { email: existing?.email, cascaded_subscriptions: childSubs.length },
+    });
+  }
+}
+
+export async function getEmailSubscriptions(
+  workspaceId: string,
+  userId: string,
+  emailIdentityId?: string
+): Promise<EmailSubscription[]> {
+  const db = loadLocalDb();
+
+  if (emailVaultRemoteAvailable && canUseSupabase(workspaceId) && isUuid(userId)) {
+    try {
+      let query = supabase
+        .from('email_subscriptions')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .order('created_at', { ascending: false });
+
+      if (emailIdentityId && isUuid(emailIdentityId)) {
+        query = query.eq('email_identity_id', emailIdentityId);
+      }
+
+      const { data, error } = await query;
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      } else if (!error && data) {
+        let changed = false;
+        for (const remote of data as EmailSubscription[]) {
+          if (isIdDeleted(db, remote.id) || isIdDeleted(db, remote.email_identity_id)) continue;
+          const idx = db.email_subscriptions.findIndex(item => item.id === remote.id);
+          if (idx >= 0) {
+            db.email_subscriptions[idx] = remote;
+          } else {
+            db.email_subscriptions.push(remote);
+          }
+          changed = true;
+        }
+        if (changed) saveLocalDb(db);
+      }
+    } catch {
+      // Fallback to localDb
+    }
+  }
+
+  return db.email_subscriptions
+    .filter(
+      sub =>
+        (sub.workspace_id === workspaceId || sub.user_id === userId) &&
+        (!emailIdentityId || sub.email_identity_id === emailIdentityId) &&
+        !isIdDeleted(db, sub.id) &&
+        !isIdDeleted(db, sub.email_identity_id)
+    )
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+}
+
+export async function createEmailSubscription(input: {
+  emailIdentityId: string;
+  workspaceId: string;
+  userId: string;
+  projectId?: string | null;
+  serviceName: string;
+  serviceUrl?: string | null;
+  category: SubscriptionCategory;
+  status: SubscriptionStatus;
+  billingCycle: BillingCycle;
+  costAmount: number;
+  currency?: string;
+  renewalDate?: string | null;
+  encryptedPayload: string;
+  nonce: string;
+  cryptoVersion?: string;
+  keyVersion?: number;
+}): Promise<EmailSubscription> {
+  const now = new Date().toISOString();
+  const db = loadLocalDb();
+  const id = crypto.randomUUID();
+
+  let record: EmailSubscription = {
+    id,
+    email_identity_id: input.emailIdentityId,
+    workspace_id: input.workspaceId,
+    user_id: input.userId,
+    project_id: input.projectId || null,
+    service_name: input.serviceName.trim(),
+    service_url: input.serviceUrl?.trim() || null,
+    category: input.category,
+    status: input.status,
+    billing_cycle: input.billingCycle,
+    cost_amount: Number.isFinite(input.costAmount) ? input.costAmount : 0,
+    currency: (input.currency || 'USD').toUpperCase(),
+    renewal_date: input.renewalDate || null,
+    encrypted_payload: input.encryptedPayload,
+    nonce: input.nonce,
+    crypto_version: input.cryptoVersion || '1',
+    key_version: input.keyVersion ?? 1,
+    created_at: now,
+    updated_at: now,
+  };
+
+  if (
+    emailVaultRemoteAvailable &&
+    canUseSupabase(input.workspaceId) &&
+    isUuid(input.userId) &&
+    isUuid(input.emailIdentityId)
+  ) {
+    try {
+      const { data, error } = await supabase
+        .from('email_subscriptions')
+        .insert({
+          id: record.id,
+          email_identity_id: record.email_identity_id,
+          workspace_id: record.workspace_id,
+          user_id: record.user_id,
+          project_id: record.project_id,
+          service_name: record.service_name,
+          service_url: record.service_url,
+          category: record.category,
+          status: record.status,
+          billing_cycle: record.billing_cycle,
+          cost_amount: record.cost_amount,
+          currency: record.currency,
+          renewal_date: record.renewal_date,
+          encrypted_payload: record.encrypted_payload,
+          nonce: record.nonce,
+          crypto_version: record.crypto_version,
+          key_version: record.key_version,
+        })
+        .select()
+        .single();
+
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      } else if (!error && data) {
+        record = data as EmailSubscription;
+      }
+    } catch {
+      // Fallback to local record
+    }
+  }
+
+  db.email_subscriptions.unshift(record);
+  saveLocalDb(db);
+
+  await logAuditEvent({
+    actor_id: input.userId,
+    action: 'email_subscription.created',
+    resource_type: 'email_subscription',
+    resource_id: record.id,
+    workspace_id: input.workspaceId,
+    project_id: record.project_id || undefined,
+    outcome: 'success',
+    metadata: {
+      service_name: record.service_name,
+      category: record.category,
+      status: record.status,
+      encrypted: true,
+    },
+  });
+
+  return record;
+}
+
+export async function updateEmailSubscription(
+  subscriptionId: string,
+  updates: Partial<
+    Pick<
+      EmailSubscription,
+      | 'email_identity_id'
+      | 'project_id'
+      | 'service_name'
+      | 'service_url'
+      | 'category'
+      | 'status'
+      | 'billing_cycle'
+      | 'cost_amount'
+      | 'currency'
+      | 'renewal_date'
+      | 'encrypted_payload'
+      | 'nonce'
+      | 'crypto_version'
+      | 'key_version'
+    >
+  >,
+  actorId?: string
+): Promise<EmailSubscription> {
+  const now = new Date().toISOString();
+  const db = loadLocalDb();
+  const idx = db.email_subscriptions.findIndex(item => item.id === subscriptionId);
+  if (idx < 0) {
+    throw new Error('Subscription record not found');
+  }
+
+  const existing = db.email_subscriptions[idx];
+  const updated: EmailSubscription = {
+    ...existing,
+    ...updates,
+    service_name:
+      updates.service_name !== undefined ? updates.service_name.trim() : existing.service_name,
+    service_url:
+      updates.service_url !== undefined
+        ? updates.service_url?.trim() || null
+        : existing.service_url,
+    updated_at: now,
+  };
+
+  db.email_subscriptions[idx] = updated;
+  saveLocalDb(db);
+
+  if (emailVaultRemoteAvailable && canUseSupabase(subscriptionId)) {
+    try {
+      const { error } = await supabase
+        .from('email_subscriptions')
+        .update({
+          ...updates,
+          service_name: updated.service_name,
+          service_url: updated.service_url,
+          updated_at: now,
+        })
+        .eq('id', subscriptionId);
+
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      }
+    } catch {
+      // Local update already persisted
+    }
+  }
+
+  if (actorId) {
+    await logAuditEvent({
+      actor_id: actorId,
+      action: 'email_subscription.updated',
+      resource_type: 'email_subscription',
+      resource_id: subscriptionId,
+      workspace_id: updated.workspace_id,
+      project_id: updated.project_id || undefined,
+      outcome: 'success',
+      metadata: {
+        service_name: updated.service_name,
+        status: updated.status,
+        encrypted: true,
+      },
+    });
+  }
+
+  return updated;
+}
+
+export async function deleteEmailSubscription(
+  subscriptionId: string,
+  actorId?: string
+): Promise<void> {
+  const db = loadLocalDb();
+  const existing = db.email_subscriptions.find(item => item.id === subscriptionId);
+
+  markIdDeleted(db, subscriptionId);
+  db.email_subscriptions = db.email_subscriptions.filter(item => item.id !== subscriptionId);
+  saveLocalDb(db);
+
+  if (emailVaultRemoteAvailable && canUseSupabase(subscriptionId)) {
+    try {
+      const { error } = await supabase
+        .from('email_subscriptions')
+        .delete()
+        .eq('id', subscriptionId);
+      if (error && isMissingRemoteTableError(error)) {
+        emailVaultRemoteAvailable = false;
+      }
+    } catch {
+      // Local deletion already persisted
+    }
+  }
+
+  if (actorId) {
+    await logAuditEvent({
+      actor_id: actorId,
+      action: 'email_subscription.deleted',
+      resource_type: 'email_subscription',
+      resource_id: subscriptionId,
+      workspace_id: existing?.workspace_id,
+      project_id: existing?.project_id || undefined,
+      outcome: 'success',
+      metadata: { service_name: existing?.service_name },
+    });
+  }
+}
+

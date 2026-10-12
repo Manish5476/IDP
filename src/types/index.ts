@@ -208,3 +208,80 @@ export interface VaultState {
   vaultKey: CryptoKey | null; // Only in memory, never persisted
   privateKey: CryptoKeyPair | null;
 }
+
+// ─── Email Identities & Subscriptions Vault Types ───────────────────
+
+export type SubscriptionCategory =
+  | 'cloud'
+  | 'ai'
+  | 'devtools'
+  | 'domain'
+  | 'database'
+  | 'design'
+  | 'communication'
+  | 'other';
+
+export type SubscriptionStatus = 'active' | 'trial' | 'free' | 'paused' | 'cancelled';
+
+export type BillingCycle = 'monthly' | 'yearly' | 'one_time' | 'free';
+
+export interface VaultTodoItem {
+  id: string;
+  text: string;
+  completed: boolean;
+  created_at: string;
+}
+
+export interface EmailIdentitySecretPayload {
+  emailPassword: string;
+  recoveryInfo: string;
+  purposeNotes: string;
+  todos: VaultTodoItem[];
+}
+
+export interface SubscriptionSecretPayload {
+  usernameOrLogin: string;
+  password: string;
+  twoFactorOrRecovery: string;
+  purposeNotes: string;
+  todos: VaultTodoItem[];
+}
+
+export interface EmailIdentity {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  email: string;
+  alias_label: string;
+  provider: string;
+  status: 'active' | 'archived';
+  encrypted_payload: string; // AES-256-GCM encrypted EmailIdentitySecretPayload JSON
+  nonce: string; // Base64 IV/nonce
+  crypto_version: string;
+  key_version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmailSubscription {
+  id: string;
+  email_identity_id: string;
+  workspace_id: string;
+  user_id: string;
+  project_id: string | null;
+  service_name: string;
+  service_url: string | null;
+  category: SubscriptionCategory;
+  status: SubscriptionStatus;
+  billing_cycle: BillingCycle;
+  cost_amount: number;
+  currency: string;
+  renewal_date: string | null;
+  encrypted_payload: string; // AES-256-GCM encrypted SubscriptionSecretPayload JSON
+  nonce: string; // Base64 IV/nonce
+  crypto_version: string;
+  key_version: number;
+  created_at: string;
+  updated_at: string;
+}
+

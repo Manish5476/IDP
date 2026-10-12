@@ -97,7 +97,9 @@ import {
   Filter,
   Edit3,
   Archive,
+  Mail,
 } from 'lucide-react';
+import { EmailSubscriptionsVaultPage } from '@/components/EmailSubscriptionsVaultPage';
 
 const LandingPage = lazy(() => import('@/pages/LandingPage'));
 const ConnectionStatusLazy = lazy(() => import('@/components/ConnectionStatus'));
@@ -578,6 +580,7 @@ function Sidebar({
     { path: '/projects', icon: FolderKanban, label: 'Projects', hasChevron: false },
     { path: '/workspaces', icon: Globe, label: 'Workspaces', hasChevron: true },
     { path: '/environments', icon: Server, label: 'Environments', hasChevron: false },
+    { path: '/subscriptions', icon: Mail, label: 'Email & Subscriptions', hasChevron: true },
     { path: '/tasks', icon: CheckSquare, label: 'Tasks Board', hasChevron: true },
     { path: '/branches', icon: GitBranch, label: 'Branches', hasChevron: false },
     { path: '/members', icon: Users, label: 'Customers & Team', hasChevron: true },
@@ -824,6 +827,7 @@ function AppLayout({ children }: { children: ReactNode }) {
     if (p.startsWith('/projects')) return 'Projects';
     if (p.startsWith('/workspaces')) return 'Workspaces';
     if (p.startsWith('/environments')) return 'Environments';
+    if (p.startsWith('/subscriptions')) return 'Email & Subscriptions';
     if (p.startsWith('/branches')) return 'Branches';
     if (p.startsWith('/tasks')) return 'Tasks Board';
     if (p.startsWith('/members')) return 'Customers & Team';
@@ -852,6 +856,7 @@ function AppLayout({ children }: { children: ReactNode }) {
       { label: 'Workspaces Management', path: '/workspaces' },
       { label: 'Projects Directory', path: '/projects' },
       { label: 'Environments & Encrypted Secrets', path: '/environments' },
+      { label: 'Email Identities & Subscriptions Vault', path: '/subscriptions' },
       { label: 'Branches & Commits', path: '/branches' },
       { label: 'Tasks & Kanban Board', path: '/tasks' },
       { label: 'Team Members & Invitations', path: '/members' },
@@ -1072,6 +1077,16 @@ function AppLayout({ children }: { children: ReactNode }) {
                       className="w-full text-left px-3.5 py-2.5 rounded-2xl hover:bg-[#F4F4F2] dark:hover:bg-white/5 text-xs font-semibold text-[#1A1D1F] dark:text-white flex items-center gap-2.5"
                     >
                       <Key className="w-4 h-4 text-amber-500" /> Add Encrypted Secret
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowCreateMenu(false);
+                        navigate('/subscriptions');
+                      }}
+                      className="w-full text-left px-3.5 py-2.5 rounded-2xl hover:bg-[#F4F4F2] dark:hover:bg-white/5 text-xs font-semibold text-[#1A1D1F] dark:text-white flex items-center gap-2.5"
+                    >
+                      <Mail className="w-4 h-4 text-indigo-500" /> Email & Subscription Vault
                     </button>
                     <button
                       type="button"
@@ -5332,6 +5347,16 @@ function AppRouter() {
             <ProtectedRoute>
               <AppLayout>
                 <EnvironmentsPage />
+              </AppLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/subscriptions"
+          element={
+            <ProtectedRoute>
+              <AppLayout>
+                <EmailSubscriptionsVaultPage />
               </AppLayout>
             </ProtectedRoute>
           }

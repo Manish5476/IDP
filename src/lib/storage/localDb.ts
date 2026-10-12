@@ -18,6 +18,8 @@ import type {
   EnvironmentType,
   TaskStatus,
   TaskPriority,
+  EmailIdentity,
+  EmailSubscription,
 } from '@/types';
 
 export interface LocalAuthUser {
@@ -47,6 +49,8 @@ interface LocalDatabaseSchema {
   tasks: Task[];
   integration_connections: IntegrationConnection[];
   audit_events: AuditEvent[];
+  email_identities: EmailIdentity[];
+  email_subscriptions: EmailSubscription[];
 }
 
 const DB_STORAGE_KEY = 'devportal_idp_user_db_v1';
@@ -71,6 +75,8 @@ function createEmptyDb(): LocalDatabaseSchema {
     tasks: [],
     integration_connections: [],
     audit_events: [],
+    email_identities: [],
+    email_subscriptions: [],
   };
 }
 
@@ -84,6 +90,8 @@ export function loadLocalDb(): LocalDatabaseSchema {
       ...createEmptyDb(),
       ...parsed,
       deleted_ids: Array.isArray(parsed.deleted_ids) ? parsed.deleted_ids : [],
+      email_identities: Array.isArray(parsed.email_identities) ? parsed.email_identities : [],
+      email_subscriptions: Array.isArray(parsed.email_subscriptions) ? parsed.email_subscriptions : [],
     };
   } catch {
     return createEmptyDb();
